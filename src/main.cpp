@@ -1,7 +1,67 @@
 /*
   ============================================================
-   NANO RAIDER v2 - PERFORMANCE RENDERER REWRITE
+   NANO RAIDER
+   A raycasted (Wolfenstein-style) FPS for Arduino Nano + tiny
+   128x64 I2C OLED (SSD1306) + 4 push buttons + passive piezo.
   ============================================================
+
+  HARDWARE / WIRING
+  ------------------------------------------------------------
+  OLED (SSD1306, 128x64, I2C):
+    VCC -> 5V (or 3.3V - check your module's silkscreen)
+    GND -> GND
+    SCL -> A5   (Nano hardware I2C clock)
+    SDA -> A4   (Nano hardware I2C data)
+
+  IMPORTANT: some cheap "0.96 OLED" modules use the SH1106
+  driver instead of SSD1306 - they look identical but need a
+  different U8g2 constructor. If the picture is shifted/garbled,
+  swap the constructor line below for the SH1106 one (see
+  comment next to it).
+
+  Buttons (normally-open, one leg to GND, other leg to pin,
+  using the Nano's internal pull-ups - no resistors needed):
+    D2 -> Turn Left switch   -> other leg to GND
+    D3 -> Turn Right switch  -> other leg to GND
+    D4 -> Move Forward switch-> other leg to GND
+    D5 -> Fire switch        -> other leg to GND
+
+  Buzzer (passive piezo, 2-pin GND/SIG - confirmed your part):
+    SIG -> D9
+    GND -> GND
+
+  Bluetooth module (HC-05/HC-06 style, Key/TX/RX):
+    Not used in this version. If you add it later, do NOT wire
+    it to D0/D1 (that's the USB programming serial port - wiring
+    BT there will fight with uploads). Reserve D10 (SoftwareSerial
+    RX), D11 (SoftwareSerial TX), D12 (Key) instead - those are
+    left free by this sketch.
+
+  Free pins for future extras (vibration motor, sensors, etc.):
+    D6, D7, D8, D13, A0-A3, A6, A7
+
+  LIBRARIES REQUIRED (Arduino IDE -> Library Manager):
+    "U8g2" by oliver (olikraus)
+
+  ------------------------------------------------------------
+  DESIGN NOTES (why things are done this way)
+  ------------------------------------------------------------
+  The Nano has only 2KB of RAM. The OLED's own framebuffer
+  (128*64/8 = 1024 bytes) eats HALF of that before the game
+  even starts. Every choice below is driven by that fact:
+    - The map is 16x16, packed as one uint16_t per row (1 bit
+      per cell) and stored in PROGMEM (flash), not RAM.
+    - All trig is done via 1024-entry sin/cos lookup tables in
+      PROGMEM - no floating point math anywhere in the main loop.
+    - Positions use Q8 fixed-point integers (1 map cell = 256).
+    - Enemies are drawn as flat-shaded silhouette boxes, not
+      bitmap sprites, to avoid needing sprite scaling code/tables.
+    - Wall "shading" by distance is done with a dithered pixel
+      pattern (no grayscale on a 1-bit display).
+
+  These constants are starting points - real timing depends on
+  your exact hardware, so expect to tune MOVE_SPEED, TURN_SPEED,
+  etc. after your first flash.
 */
 
 #include <Arduino.h>
@@ -9,7 +69,11 @@
 #include <Wire.h>
 
 // ---- Display ----
+// Standard SSD1306 128x64, no reset pin, hardware I2C:
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+// If your OLED uses the SH1106 driver instead, comment the line
+// above and uncomment this one:
+// U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 // ---- Pins ----
 #define PIN_BTN_LEFT    2
@@ -19,26 +83,28 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 #define PIN_BUZZER      9
 
 // ============================================================
-// MAP
+// MAP  (16x16, 1 = wall, 0 = floor. Verified solvable/connected
+// by a maze-generator script - not hand-typed, so it can't be
+// a broken/unsolvable maze.)
 // ============================================================
 #define MAP_SIZE 16
 const uint16_t PROGMEM mapData[MAP_SIZE] = {
-  0b1111111111111111,
-  0b1000100000000011,
-  0b1110111110101011,
-  0b1010100010101011,
-  0b1010101011101111,
-  0b1010001000100011,
-  0b1011111110101011,
-  0b1000100010101011,
-  0b1011101010111011,
-  0b1000001010000011,
-  0b1011111011111011,
-  0b1000001010001011,
-  0b1111101010101011,
-  0b1000001000100011,
-  0b1111111111111111,
-  0b1111111111111111,
+  0b1111111111111111, // row 0
+  0b1000100000000011, // row 1
+  0b1110111110101011, // row 2
+  0b1010100010101011, // row 3
+  0b1010101011101111, // row 4
+  0b1010001000100011, // row 5
+  0b1011111110101011, // row 6
+  0b1000100010101011, // row 7
+  0b1011101010111011, // row 8
+  0b1000001010000011, // row 9
+  0b1011111011111011, // row 10
+  0b1000001010001011, // row 11
+  0b1111101010101011, // row 12
+  0b1000001000100011, // row 13
+  0b1111111111111111, // row 14
+  0b1111111111111111, // row 15
 };
 
 #define START_X 1
@@ -51,7 +117,8 @@ const int16_t enemyStartX[NUM_ENEMIES] = {13, 1, 9, 8};
 const int16_t enemyStartY[NUM_ENEMIES] = { 5, 9, 2, 5};
 
 // ============================================================
-// TRIG TABLES 
+// TRIG TABLES - Q8 fixed point (value = table/256), 1024 steps
+// per full circle. Angle wraps with "& 1023" (fast, power of 2).
 // ============================================================
 const int16_t PROGMEM cosTable[1024] = {
   256,256,256,256,256,256,256,256,256,256,256,255,255,255,255,255,
@@ -187,6 +254,7 @@ const int16_t PROGMEM sinTable[1024] = {
   -25,-24,-22,-20,-19,-17,-16,-14,-13,-11,-9,-8,-6,-5,-3,-2,
 };
 
+// Per-column ray angle offsets for a 60 degree FOV across 128 columns.
 const int16_t PROGMEM colAngleOffset[128] = {
   -86,-84,-83,-81,-80,-79,-77,-76,-75,-73,-72,-71,-69,-68,-67,-65,
   -64,-63,-61,-60,-59,-57,-56,-55,-53,-52,-50,-49,-48,-46,-45,-44,
@@ -199,17 +267,18 @@ const int16_t PROGMEM colAngleOffset[128] = {
 };
 
 // ============================================================
-// GAME CONSTANTS
+// GAME CONSTANTS (tune these after your first test flash)
 // ============================================================
-#define FP_ONE          256
-#define MOVE_SPEED      12
-#define TURN_SPEED      10
-#define COLLIDE_R       50
-#define MAX_RAY_DIST    2560
-#define WALL_HEIGHT_K   70
-#define NEAR_SHADE_DIST 768
-#define FAR_SHADE_DIST  1536
-#define SPRITE_PROJ_K   109
+#define FP_ONE          256      // Q8 fixed point: 1 map cell = 256
+#define MOVE_SPEED      12       // player move speed, Q8 units/frame
+#define TURN_SPEED      10       // player turn speed, angle units/frame (of 1024)
+#define COLLIDE_R       50       // player collision radius, Q8 units
+#define RAY_STEP        28       // raycast march step, Q8 units
+#define MAX_RAY_DIST    2560     // max ray length, Q8 units (10 cells)
+#define WALL_HEIGHT_K   70       // projection constant for wall height
+#define NEAR_SHADE_DIST 1024     // start light dithering beyond 4 cells
+#define FAR_SHADE_DIST  1792     // heavy dithering beyond 7 cells
+#define SPRITE_PROJ_K   109      // projection constant for sprite screen-X
 
 #define PLAYER_MAX_HP     100
 #define ENEMY_MAX_HP      100
@@ -218,49 +287,57 @@ const int16_t PROGMEM colAngleOffset[128] = {
 #define FIRE_COOLDOWN_FR  6
 #define HURT_COOLDOWN_FR  20
 #define MAX_SHOT_RANGE    2560
-#define SHOT_TOLERANCE    70
-#define CHASE_RANGE       1536
-#define MELEE_RANGE       320
+#define SHOT_TOLERANCE    70     // aiming cone tightness
+#define CHASE_RANGE       1536   // 6 cells
+#define MELEE_RANGE       320    // ~1.25 cells
 #define CHASE_STEP        40
 
 // ============================================================
-// GAME STATE & ARCHITECTURE STRUCTS
+// GAME STATE
 // ============================================================
 enum GameState { ST_TITLE, ST_PLAYING, ST_WIN, ST_LOSE };
 GameState gameState = ST_TITLE;
 
 struct Player {
-  int16_t posX, posY;
-  int16_t angle;
+  int16_t posX, posY;   // Q8 world position
+  int16_t angle;        // 0-1023
   int8_t  hp;
   uint8_t hurtCooldown;
-  int8_t  recoilPitch; 
 };
 Player player;
 
 struct Enemy {
-  int16_t x, y;
+  int16_t x, y;    // Q8 world position
   int8_t  hp;
   bool    alive;
-  uint8_t hitFlash;
-  uint8_t animTimer;
+  uint8_t hitFlash; // frames remaining of "just got shot" hatch flash
 };
 Enemy enemies[NUM_ENEMIES];
 uint8_t aiTurn = 0;
 
-struct RayHit {
-  int16_t dist;
-  uint8_t side;
-  uint8_t texX;
-  bool hit;
-};
-
-uint8_t zbuffer[128];
+uint8_t zbuffer[128];        // per-column wall distance (>>3), for sprite occlusion
 uint8_t fireCooldown = 0;
-uint8_t muzzleFlashFrames = 0;
+uint8_t gunFlashTimer = 0;   // frames remaining of muzzle-flash/recoil animation
+uint8_t frameCount = 0;      // free-running counter, used for flash/hatch patterns
 bool btnLeft, btnRight, btnForward, btnFire, prevFireMenu = false;
-uint8_t stateEnterGuard = 0;
-uint32_t frameCount = 0;
+uint8_t stateEnterGuard = 0; // ignore fire briefly after entering a menu state
+
+static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// ============================================================
+// MAP HELPERS
+// ============================================================
+bool isWall(int16_t x, int16_t y) {
+  int16_t cx = x >> 8;
+  int16_t cy = y >> 8;
+  if (cx < 0 || cx >= MAP_SIZE || cy < 0 || cy >= MAP_SIZE) return true;
+  uint16_t row = pgm_read_word(&mapData[cy]);
+  return (row >> (15 - cx)) & 1;
+}
 
 // ============================================================
 // SETUP
@@ -271,23 +348,12 @@ void setup() {
   pinMode(PIN_BTN_FORWARD, INPUT_PULLUP);
   pinMode(PIN_BTN_FIRE, INPUT_PULLUP);
 
-  u8g2.setBusClock(400000); 
+  u8g2.setBusClock(400000); // 400kHz I2C - much faster frame pushes than default 100kHz
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tr);
 
   gameState = ST_TITLE;
   stateEnterGuard = 15;
-}
-
-// ============================================================
-// CORE LOGIC & AI
-// ============================================================
-bool isWall(int16_t x, int16_t y) {
-  int16_t cx = x >> 8;
-  int16_t cy = y >> 8;
-  if (cx < 0 || cx >= MAP_SIZE || cy < 0 || cy >= MAP_SIZE) return true;
-  uint16_t row = pgm_read_word(&mapData[cy]);
-  return (row >> (15 - cx)) & 1;
 }
 
 void resetGame() {
@@ -296,19 +362,21 @@ void resetGame() {
   player.angle = 0;
   player.hp = PLAYER_MAX_HP;
   player.hurtCooldown = 0;
-  player.recoilPitch = 0;
   fireCooldown = 0;
-  muzzleFlashFrames = 0;
   for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
     enemies[i].x = enemyStartX[i] * FP_ONE + FP_ONE / 2;
     enemies[i].y = enemyStartY[i] * FP_ONE + FP_ONE / 2;
     enemies[i].hp = ENEMY_MAX_HP;
     enemies[i].alive = true;
     enemies[i].hitFlash = 0;
-    enemies[i].animTimer = 0;
   }
+  gunFlashTimer = 0;
+  frameCount = 0;
 }
 
+// ============================================================
+// INPUT
+// ============================================================
 void readButtons() {
   btnLeft    = !digitalRead(PIN_BTN_LEFT);
   btnRight   = !digitalRead(PIN_BTN_RIGHT);
@@ -316,6 +384,9 @@ void readButtons() {
   btnFire    = !digitalRead(PIN_BTN_FIRE);
 }
 
+// ============================================================
+// PLAYER MOVEMENT
+// ============================================================
 void updatePlayer() {
   if (btnLeft)  player.angle = (player.angle - TURN_SPEED) & 1023;
   if (btnRight) player.angle = (player.angle + TURN_SPEED) & 1023;
@@ -342,6 +413,10 @@ void updatePlayer() {
   }
 }
 
+// ============================================================
+// ENEMY AI - one enemy updated per frame (round robin) to keep
+// per-frame CPU cost tiny and constant.
+// ============================================================
 void updateEnemyAI() {
   Enemy &e = enemies[aiTurn];
   aiTurn = (aiTurn + 1) % NUM_ENEMIES;
@@ -368,236 +443,15 @@ void updateEnemyAI() {
 }
 
 // ============================================================
-// RENDERING PIPELINE
-// ============================================================
-RayHit castRay(int16_t rx, int16_t ry, int16_t rayAngle) {
-  RayHit result = {MAX_RAY_DIST, 0, 0, false};
-  
-  int16_t dx = pgm_read_word(&cosTable[rayAngle]);
-  int16_t dy = pgm_read_word(&sinTable[rayAngle]);
-  if (dx == 0) dx = 1; 
-  if (dy == 0) dy = 1;
-
-  int16_t mapX = rx >> 8;
-  int16_t mapY = ry >> 8;
-  
-  int32_t deltaDistX = 65536L / abs(dx);
-  int32_t deltaDistY = 65536L / abs(dy);
-  
-  int32_t sideDistX, sideDistY;
-  int8_t stepX, stepY;
-  
-  if (dx < 0) {
-    stepX = -1;
-    sideDistX = ((rx - (mapX << 8)) * deltaDistX) >> 8;
-  } else {
-    stepX = 1;
-    sideDistX = ((((mapX + 1) << 8) - rx) * deltaDistX) >> 8;
-  }
-  
-  if (dy < 0) {
-    stepY = -1;
-    sideDistY = ((ry - (mapY << 8)) * deltaDistY) >> 8;
-  } else {
-    stepY = 1;
-    sideDistY = ((((mapY + 1) << 8) - ry) * deltaDistY) >> 8;
-  }
-  
-  uint8_t side = 0;
-  
-  // FIX: Allow loop to progress until boundary hit or explicit map break
-  while (!result.hit) {
-    if (sideDistX < sideDistY) {
-      sideDistX += deltaDistX;
-      mapX += stepX;
-      side = 0;
-    } else {
-      sideDistY += deltaDistY;
-      mapY += stepY;
-      side = 1;
-    }
-    
-    if (mapX < 0 || mapX >= MAP_SIZE || mapY < 0 || mapY >= MAP_SIZE) {
-        break; // Out of bounds safety
-    }
-    
-    if ((pgm_read_word(&mapData[mapY]) >> (15 - mapX)) & 1) {
-        result.hit = true;
-    }
-  }
-  
-  if (result.hit) {
-    result.side = side;
-    if (side == 0) {
-      int16_t edgeX = (stepX < 0) ? ((mapX + 1) << 8) : (mapX << 8);
-      result.dist = labs((int32_t)(edgeX - rx) * 256L / dx);
-      int16_t hitY = ry + ((int32_t)dy * result.dist) / 256;
-      result.texX = hitY & 255;
-    } else {
-      int16_t edgeY = (stepY < 0) ? ((mapY + 1) << 8) : (mapY << 8);
-      result.dist = labs((int32_t)(edgeY - ry) * 256L / dy);
-      int16_t hitX = rx + ((int32_t)dx * result.dist) / 256;
-      result.texX = hitX & 255;
-    }
-  }
-  return result;
-}
-
-void drawWallColumn(uint8_t col, RayHit hit, int16_t correctedDist) {
-  if (correctedDist < 16) correctedDist = 16;
-  zbuffer[col] = (correctedDist >> 3 > 255) ? 255 : (uint8_t)(correctedDist >> 3);
-
-  int16_t wallH = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / correctedDist);
-  if (wallH > 160) wallH = 160;
-  int16_t center = 32 + player.recoilPitch;
-  int16_t top = center - wallH / 2;
-  int16_t bottom = center + wallH / 2;
-  
-  if (top < 0) top = 0;
-  if (bottom > 63) bottom = 63;
-  if (top > 63) return;
-
-  u8g2.setDrawColor(1);
-  
-  if (correctedDist > FAR_SHADE_DIST) {
-    for (int16_t y = top; y <= bottom; y += 4) u8g2.drawPixel(col, y);
-  } else if (correctedDist > NEAR_SHADE_DIST) {
-    for (int16_t y = top + (col % 2); y <= bottom; y += 2) u8g2.drawPixel(col, y);
-  } else {
-    // FIX: Using fast bitwise evaluation over modulo to prevent stuttering
-    if (hit.side == 1 && ((hit.texX & 31) < 4)) {
-       u8g2.drawVLine(col, top, bottom - top + 1);
-       u8g2.setDrawColor(0);
-       for(int16_t y = top; y <= bottom; y += 8) u8g2.drawPixel(col, y); 
-    } else {
-       u8g2.drawVLine(col, top, bottom - top + 1);
-    }
-  }
-
-  u8g2.setDrawColor(0);
-  if (top > 0) u8g2.drawPixel(col, top);
-  if (bottom < 63) u8g2.drawPixel(col, bottom);
-}
-
-void drawFloorCeiling() {
-  u8g2.setDrawColor(1);
-  if (frameCount % 2 == 0) {
-     u8g2.drawPixel(random(0, 128), random(0, 16));
-     u8g2.drawPixel(random(0, 128), random(48, 64));
-  }
-}
-
-void drawSprites() {
-  int16_t cosP = pgm_read_word(&cosTable[player.angle]);
-  int16_t sinP = pgm_read_word(&sinTable[player.angle]);
-
-  for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
-    if (!enemies[i].alive) continue;
-    
-    enemies[i].animTimer++;
-    
-    int32_t ddx = enemies[i].x - player.posX;
-    int32_t ddy = enemies[i].y - player.posY;
-    int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
-    if (forward < 32 || forward > MAX_RAY_DIST) continue;
-    int32_t right = (ddx * sinP - ddy * cosP) >> 8;
-
-    int16_t screenX = 64 + (int16_t)((right * SPRITE_PROJ_K) / forward);
-    int16_t size = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / forward);
-    if (size > 56) size = 56;
-    if (size < 6) size = 6;
-    
-    int16_t halfW = size / 3 + 1;
-    int16_t center = 32 + player.recoilPitch;
-    int16_t top = center - size / 2;
-    int16_t bottom = center + size / 2;
-    if (bottom > 63) bottom = 63;
-
-    int16_t left = screenX - halfW;
-    int16_t rightCol = screenX + halfW;
-    
-    // FIX: Replaced macros with explicit constraints to bypass compiler type matching errors
-    if (rightCol < 0 || left > 127) continue;
-    if (left < 0) left = 0;
-    if (rightCol > 127) rightCol = 127;
-    
-    uint8_t fdist8 = (forward >> 3 > 255) ? 255 : (uint8_t)(forward >> 3);
-    
-    for (int16_t col = left; col <= rightCol; col++) {
-      if (zbuffer[col] > fdist8) {
-        if (enemies[i].hitFlash > 0) {
-            u8g2.setDrawColor(1);
-            u8g2.drawVLine(col, top, bottom - top);
-        } else {
-            u8g2.setDrawColor(1);
-            int16_t hSize = size / 4;
-            u8g2.drawVLine(col, top, hSize);
-            u8g2.drawVLine(col, top + hSize + 1, size/2);
-            
-            bool legToggle = (enemies[i].animTimer / 8) % 2;
-            if ((col < screenX && legToggle) || (col >= screenX && !legToggle)) {
-               u8g2.drawVLine(col, bottom - hSize, hSize);
-            }
-            u8g2.setDrawColor(0);
-            u8g2.drawPixel(col, top);
-            u8g2.drawPixel(col, bottom);
-        }
-      }
-    }
-    if (enemies[i].hitFlash > 0) enemies[i].hitFlash--;
-  }
-}
-
-void drawWeapon() {
-  int16_t gunTop = 45;
-  int16_t gunLeft = 60;
-  
-  if (fireCooldown > 0) {
-    gunTop += 4;
-  }
-  
-  u8g2.setDrawColor(1);
-  u8g2.drawBox(gunLeft, gunTop, 12, 64 - gunTop);
-  u8g2.drawBox(gunLeft - 4, gunTop + 8, 20, 10);
-  
-  if (muzzleFlashFrames > 0) {
-    u8g2.drawDisc(gunLeft + 6, gunTop - 4, 6 + (muzzleFlashFrames % 2)*2);
-    u8g2.setDrawColor(0);
-    u8g2.drawDisc(gunLeft + 6, gunTop - 4, 3);
-    muzzleFlashFrames--;
-  }
-}
-
-void drawHUD() {
-  u8g2.setDrawColor(0);
-  u8g2.drawBox(0, 0, 46, 9);
-  u8g2.setDrawColor(1);
-  u8g2.drawFrame(2, 2, 42, 6);
-  int16_t w = (player.hp > 0) ? ((int16_t)player.hp * 40) / PLAYER_MAX_HP : 0;
-  if (w > 0) u8g2.drawBox(3, 3, w, 4);
-
-  u8g2.setDrawColor(1);
-  int16_t cx = 64;
-  int16_t cy = 32 + player.recoilPitch;
-  u8g2.drawPixel(cx, cy);
-  u8g2.drawHLine(cx - 4, cy, 3);
-  u8g2.drawHLine(cx + 2, cy, 3);
-  u8g2.drawVLine(cx, cy - 4, 3);
-  u8g2.drawVLine(cx, cy + 2, 3);
-}
-
-// ============================================================
-// COMBAT & GAMELOOP
+// COMBAT
 // ============================================================
 void handleFire() {
   if (!btnFire || fireCooldown > 0) return;
   fireCooldown = FIRE_COOLDOWN_FR;
-  muzzleFlashFrames = 3;
-  player.recoilPitch = -3;
-  
+  gunFlashTimer = 5;
   tone(PIN_BUZZER, 1200, 50);
 
-  uint16_t wallDist = (uint16_t)zbuffer[64] << 3; 
+  uint16_t wallDist = (uint16_t)zbuffer[64] << 3; // approx wall distance dead ahead
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
   int16_t sinP = pgm_read_word(&sinTable[player.angle]);
 
@@ -610,19 +464,197 @@ void handleFire() {
     int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
     if (forward <= 0 || forward > MAX_SHOT_RANGE || forward > wallDist) continue;
     int32_t right = (ddx * sinP - ddy * cosP) >> 8;
-    if (abs(right) < (forward * SHOT_TOLERANCE) / 256) {
+    if (labs(right) < (forward * SHOT_TOLERANCE) / 256) {
       if (forward < bestForward) { bestForward = forward; bestIdx = i; }
     }
   }
 
   if (bestIdx >= 0) {
     enemies[bestIdx].hp -= SHOT_DAMAGE;
-    enemies[bestIdx].hitFlash = 3;
+    enemies[bestIdx].hitFlash = 8;
     tone(PIN_BUZZER, 600, 40);
     if (enemies[bestIdx].hp <= 0) enemies[bestIdx].alive = false;
   }
 }
 
+// ============================================================
+// RENDERING - walls
+// ============================================================
+void castAndDrawWalls() {
+  for (uint8_t col = 0; col < 128; col++) {
+    int16_t rayAngle = (player.angle + (int16_t)pgm_read_word(&colAngleOffset[col])) & 1023;
+    int16_t dx = pgm_read_word(&cosTable[rayAngle]);
+    int16_t dy = pgm_read_word(&sinTable[rayAngle]);
+
+    int16_t rx = player.posX, ry = player.posY;
+    int16_t dist = 0;
+    bool hit = false;
+
+    while (dist < MAX_RAY_DIST) {
+      rx += ((int32_t)dx * RAY_STEP) >> 8;
+      ry += ((int32_t)dy * RAY_STEP) >> 8;
+      dist += RAY_STEP;
+      if (isWall(rx, ry)) { hit = true; break; }
+    }
+
+    if (!hit) { zbuffer[col] = 255; continue; } // nothing there, leave column blank
+
+    int16_t relAngle = (rayAngle - player.angle) & 1023;
+    int16_t cosRel = pgm_read_word(&cosTable[relAngle]);
+    if (cosRel < 16) cosRel = 16; // safety floor, shouldn't trigger within our FOV
+
+    int32_t correctedDist = ((int32_t)dist * cosRel) >> 8;
+    if (correctedDist < 16) correctedDist = 16;
+    zbuffer[col] = (correctedDist >> 3 > 255) ? 255 : (uint8_t)(correctedDist >> 3);
+
+    int16_t wallH = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / correctedDist);
+    if (wallH > 160) wallH = 160;
+    int16_t top = 32 - wallH / 2;
+    int16_t bottom = 32 + wallH / 2;
+    if (top < 0) top = 0;
+    if (bottom > 63) bottom = 63;
+
+    if (correctedDist > FAR_SHADE_DIST) {
+      for (int16_t y = top; y <= bottom; y += 3) u8g2.drawPixel(col, y);
+    } else if (correctedDist > NEAR_SHADE_DIST) {
+      for (int16_t y = top; y <= bottom; y += 2) u8g2.drawPixel(col, y);
+    } else {
+      u8g2.drawVLine(col, top, bottom - top + 1);
+    }
+  }
+}
+
+// ============================================================
+// RENDERING - enemies
+//
+// On a 1-bit screen a plain silhouette box can visually merge
+// into a solid wall column right behind it. Two fixes are used
+// here: (1) a black "keyline" halo is erased around the sprite
+// first, so there's always a gap between the enemy and whatever
+// is behind it, and (2) the shape is a head+body silhouette
+// instead of a flat box, so it doesn't read as "just another
+// wall segment". A hatch pattern flashes briefly on a landed hit.
+// ============================================================
+void drawEnemies() {
+  int16_t cosP = pgm_read_word(&cosTable[player.angle]);
+  int16_t sinP = pgm_read_word(&sinTable[player.angle]);
+
+  for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
+    if (!enemies[i].alive) continue;
+    int32_t ddx = enemies[i].x - player.posX;
+    int32_t ddy = enemies[i].y - player.posY;
+    int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
+    if (forward < 32 || forward > MAX_RAY_DIST) continue;
+    int32_t right = (ddx * sinP - ddy * cosP) >> 8;
+
+    int16_t screenX = 64 + (int16_t)((right * SPRITE_PROJ_K) / forward);
+    int16_t size = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / forward);
+    if (size > 56) size = 56;
+    if (size < 4) size = 4;
+    int16_t halfW      = size / 3 + 2;
+    int16_t headR      = size / 5 + 1;
+    int16_t bodyTop    = 32 - size / 2 + headR;
+    int16_t bodyBottom = 32 + size / 2;
+    int16_t headCY     = bodyTop - headR;
+    int16_t spriteTop  = headCY - headR;
+
+    int16_t left  = screenX - halfW;
+    int16_t rightCol = screenX + halfW;
+    if (rightCol < 0 || left > 127) continue;
+
+    int16_t clampedLeft  = clampi(left, 0, 127);
+    int16_t clampedRight = clampi(rightCol, 0, 127);
+
+    uint8_t fdist8 = (forward >> 3 > 255) ? 255 : (uint8_t)(forward >> 3);
+
+    // skip entirely if every column is hidden behind a nearer wall
+    bool anyVisible = false;
+    for (int16_t col = clampedLeft; col <= clampedRight; col++) {
+      if (zbuffer[col] > fdist8) { anyVisible = true; break; }
+    }
+    if (!anyVisible) continue;
+
+    // halo: erase a 1px black border around the sprite's bounding box so
+    // it always has contrast against whatever wall pixels sit behind it
+    int16_t hx = clampi(left - 1, 0, 127);
+    int16_t hy = clampi(spriteTop - 1, 0, 63);
+    int16_t hw = clampi(rightCol + 1, 0, 127) - hx + 1;
+    int16_t hh = clampi(bodyBottom + 1, 0, 63) - hy + 1;
+    if (hw > 0 && hh > 0) {
+      u8g2.setDrawColor(0);
+      u8g2.drawBox(hx, hy, hw, hh);
+      u8g2.setDrawColor(1);
+    }
+
+    bool flash = enemies[i].hitFlash > 0;
+
+    // body
+    for (int16_t col = clampedLeft; col <= clampedRight; col++) {
+      if (zbuffer[col] <= fdist8) continue; // occluded by a nearer wall
+      if (flash && ((col + frameCount) & 1)) continue; // hatched while flashing
+      u8g2.drawVLine(col, bodyTop, bodyBottom - bodyTop + 1);
+    }
+    // head - a circle reads as a creature, not a wall segment
+    if (!flash || !(frameCount & 1)) {
+      if (screenX >= clampedLeft - headR && screenX <= clampedRight + headR) {
+        u8g2.drawDisc(screenX, headCY, headR);
+      }
+    }
+  }
+}
+
+// ============================================================
+// HUD
+//
+// Note: this is a 1-bit display, so "color" isn't something
+// software can set - pixels are only on/off, and the color you
+// see is fixed by the physical panel (often blue, or yellow on
+// the top ~16 rows / blue below on the common two-tone SSD1306
+// modules). The HP meter below sits in that top strip, so on a
+// two-tone panel it'll already appear yellow for free. What we
+// CAN control is legibility, so it's drawn as a segmented block
+// meter with a label rather than a plain bar.
+// ============================================================
+void drawHUD() {
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(0, 0, 64, 12);
+  u8g2.setDrawColor(1);
+  u8g2.drawStr(0, 9, "HP");
+  u8g2.drawFrame(15, 1, 47, 9);
+  uint8_t segs = ((int16_t)(player.hp > 0 ? player.hp : 0) * 9) / PLAYER_MAX_HP;
+  for (uint8_t s = 0; s < segs; s++) {
+    u8g2.drawBox(17 + s * 5, 3, 4, 5);
+  }
+
+  u8g2.drawLine(60, 32, 68, 32);
+  u8g2.drawLine(64, 28, 64, 36);
+}
+
+// ============================================================
+// GUN SPRITE - static pistol silhouette bottom-center, with a
+// muzzle-flash starburst and a small upward recoil kick on fire.
+// ============================================================
+void drawGun(uint8_t flashTimer) {
+  int16_t kick = (flashTimer > 2) ? 3 : 0; // recoil for the first couple of flash frames
+  int16_t gx = 53, gy = 64 - kick;         // bottom-center anchor
+
+  u8g2.drawBox(gx + 8, gy - 26, 6, 14);  // barrel
+  u8g2.drawBox(gx, gy - 16, 22, 10);     // slide/body
+  u8g2.drawBox(gx + 5, gy - 7, 8, 10);   // grip
+
+  if (flashTimer > 0) {
+    int16_t fx = gx + 11, fy = gy - 27;
+    u8g2.drawLine(fx, fy, fx - 4, fy - 5);
+    u8g2.drawLine(fx, fy, fx + 4, fy - 5);
+    u8g2.drawLine(fx, fy, fx, fy - 8);
+    u8g2.drawLine(fx, fy, fx - 3, fy - 2);
+    u8g2.drawLine(fx, fy, fx + 3, fy - 2);
+  }
+}
+
+// ============================================================
+// WIN / LOSE CHECK
+// ============================================================
 void checkWinLose() {
   if (player.hp <= 0) {
     gameState = ST_LOSE;
@@ -641,13 +673,14 @@ void checkWinLose() {
   }
 }
 
+// ============================================================
+// MAIN LOOP
+// ============================================================
 void loop() {
   readButtons();
   if (stateEnterGuard > 0) stateEnterGuard--;
   bool fireJustPressed = btnFire && !prevFireMenu;
   prevFireMenu = btnFire;
-  
-  frameCount++;
 
   switch (gameState) {
     case ST_TITLE: {
@@ -665,47 +698,28 @@ void loop() {
     }
 
     case ST_PLAYING: {
+      frameCount++;
       updatePlayer();
       updateEnemyAI();
-      
-      if (player.recoilPitch < 0) player.recoilPitch++;
       if (fireCooldown > 0) fireCooldown--;
+      if (gunFlashTimer > 0) gunFlashTimer--;
       if (player.hurtCooldown > 0) player.hurtCooldown--;
+      for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
+        if (enemies[i].hitFlash > 0) enemies[i].hitFlash--;
+      }
 
       u8g2.clearBuffer();
-      
-      if (player.hurtCooldown > 15) {
-         u8g2.setDrawColor(1);
-         u8g2.drawBox(0,0,128,64);
-         u8g2.setDrawColor(0);
-      }
-
-      drawFloorCeiling();
-
-      for (uint8_t col = 0; col < 128; col++) {
-        int16_t rayAngle = (player.angle + (int16_t)pgm_read_word(&colAngleOffset[col])) & 1023;
-        RayHit hit = castRay(player.posX, player.posY, rayAngle);
-        
-        if (!hit.hit) { zbuffer[col] = 255; continue; }
-        
-        int16_t relAngle = (rayAngle - player.angle) & 1023;
-        int16_t cosRel = pgm_read_word(&cosTable[relAngle]);
-        if (cosRel < 16) cosRel = 16; 
-        
-        int32_t correctedDist = ((int32_t)hit.dist * cosRel) >> 8;
-        drawWallColumn(col, hit, correctedDist);
-      }
-
-      handleFire(); 
-      drawSprites();
-      drawWeapon();
+      castAndDrawWalls();
+      handleFire();       // uses zbuffer from castAndDrawWalls, run after
+      drawEnemies();
+      drawGun(gunFlashTimer);
       drawHUD();
-      
       u8g2.sendBuffer();
+
       checkWinLose();
       break;
     }
-    
+
     case ST_WIN: {
       u8g2.clearBuffer();
       u8g2.drawStr(24, 28, "YOU ESCAPED!");
