@@ -1,0 +1,29 @@
+# PlatformIO
+.pio/
+
+# VS Code
+.vscode
+.vscode/ipch/
+.vscode/.browse.c_cpp.db*
+.vscode/*.log
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+
+# Compiled objects
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+
+# Temporary files
+*.tmp
+*.bak
