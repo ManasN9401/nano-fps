@@ -684,25 +684,15 @@ void drawTrapezium(int x, int y, int topW, int bottomW, int h)
     int botLeftX  = x;
     int botRightX = x + bottomW - 1;
 
-    // Top edge
     u8g2.drawHLine(topLeftX, y - h + 1, topW);
-
-    // Bottom edge
     u8g2.drawHLine(botLeftX, y, bottomW);
-
-    // Left side
-    u8g2.drawLine(botLeftX, y,
-                  topLeftX, y - h + 1);
-
-    // Right side
-    u8g2.drawLine(botRightX, y,
-                  topRightX, y - h + 1);
-
+    u8g2.drawLine(botLeftX, y, topLeftX, y - h + 1);
+    u8g2.drawLine(botRightX, y, topRightX, y - h + 1);
     u8g2.setDrawColor(1);
 }
 
 void drawGun(uint8_t flashTimer) {
-  // recoil: sharp kick on the first frame, eased settle back down
+
   static const int8_t recoilCurve[5] = {0, 6, 8, 8, 2};
   int16_t kick = recoilCurve[flashTimer > 5 ? 5 : flashTimer];
   int16_t gx = 55, gy = 64; // bottom-center anchor
