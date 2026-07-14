@@ -634,21 +634,44 @@ void drawHUD() {
 // GUN SPRITE - static pistol silhouette bottom-center, with a
 // muzzle-flash starburst and a small upward recoil kick on fire.
 // ============================================================
+// void drawWeapon() {
+//   int16_t gunTop = 45;
+//   int16_t gunLeft = 60;
+  
+//   if (fireCooldown > 0) {
+//     gunTop += 4;
+//   }
+  
+//   u8g2.setDrawColor(1);
+//   u8g2.drawBox(gunLeft, gunTop, 12, 64 - gunTop);
+//   u8g2.drawBox(gunLeft - 4, gunTop + 8, 20, 10);
+  
+//   if (muzzleFlashFrames > 0) {
+//     u8g2.drawDisc(gunLeft + 6, gunTop - 4, 6 + (muzzleFlashFrames % 2)*2);
+//     u8g2.setDrawColor(0);
+//     u8g2.drawDisc(gunLeft + 6, gunTop - 4, 3);
+//     muzzleFlashFrames--;
+//   }
+// }
+
 void drawGun(uint8_t flashTimer) {
   int16_t kick = (flashTimer > 2) ? 3 : 0; // recoil for the first couple of flash frames
-  int16_t gx = 53, gy = 64 - kick;         // bottom-center anchor
+  int16_t gx = 46, gy = 44 - kick;         // bottom-center anchor, kept inside the screen
 
-  u8g2.drawBox(gx + 8, gy - 26, 6, 14);  // barrel
-  u8g2.drawBox(gx, gy - 16, 22, 10);     // slide/body
-  u8g2.drawBox(gx + 5, gy - 7, 8, 10);   // grip
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(gx, gy, 12, 18);
+  u8g2.drawBox(gx - 4, gy + 8, 20, 10);
 
   if (flashTimer > 0) {
-    int16_t fx = gx + 11, fy = gy - 27;
+    int16_t fx = gx + 11, fy = gy - 10;
     u8g2.drawLine(fx, fy, fx - 4, fy - 5);
     u8g2.drawLine(fx, fy, fx + 4, fy - 5);
     u8g2.drawLine(fx, fy, fx, fy - 8);
     u8g2.drawLine(fx, fy, fx - 3, fy - 2);
     u8g2.drawLine(fx, fy, fx + 3, fy - 2);
+    u8g2.drawDisc(gx + 6, gy - 4, 6 + (flashTimer % 2) * 2);
+    u8g2.setDrawColor(0);
+    u8g2.drawDisc(gx + 6, gy - 4, 3);
   }
 }
 
