@@ -643,6 +643,7 @@ void drawHUD() {
     u8g2.drawBox(17 + s * 5, 3, 4, 5);
   }
 
+  u8g2.setDrawColor(2);
   u8g2.drawLine(60, 32, 68, 32);
   u8g2.drawLine(64, 28, 64, 36);
 }
@@ -663,29 +664,73 @@ void drawGunPart(int16_t x, int16_t y, int16_t w, int16_t h) {
 // big background rectangle, so it separates cleanly from wall
 // texture without looking like it's floating in a black panel.
 // ============================================================
+void drawTrapezium(int x, int y, int topW, int bottomW, int h)
+{
+    u8g2.setDrawColor(1);
+
+    for (int i = 0; i < h; i++)
+    {
+        int w = bottomW - (bottomW - topW) * i / (h - 1);
+        int left = x + (bottomW - w) / 2;
+
+        u8g2.drawHLine(left, y - i, w);
+    }
+
+    u8g2.setDrawColor(0);
+
+    int topLeftX  = x + (bottomW - topW) / 2;
+    int topRightX = topLeftX + topW - 1;
+
+    int botLeftX  = x;
+    int botRightX = x + bottomW - 1;
+
+    // Top edge
+    u8g2.drawHLine(topLeftX, y - h + 1, topW);
+
+    // Bottom edge
+    u8g2.drawHLine(botLeftX, y, bottomW);
+
+    // Left side
+    u8g2.drawLine(botLeftX, y,
+                  topLeftX, y - h + 1);
+
+    // Right side
+    u8g2.drawLine(botRightX, y,
+                  topRightX, y - h + 1);
+
+    u8g2.setDrawColor(1);
+}
+
 void drawGun(uint8_t flashTimer) {
   // recoil: sharp kick on the first frame, eased settle back down
-  static const int8_t recoilCurve[6] = {0, 6, 4, 3, 1, 0};
+  static const int8_t recoilCurve[5] = {0, 6, 8, 8, 2};
   int16_t kick = recoilCurve[flashTimer > 5 ? 5 : flashTimer];
-  int16_t gx = 53, gy = 64 - kick; // bottom-center anchor
+  int16_t gx = 55, gy = 64; // bottom-center anchor
 
-  drawGunPart(gx,     gy - 21, 22, 11); // slide / body
-  drawGunPart(gx + 9, gy - 34, 6, 15);  // barrel (longer, more rifle-like block)
-  drawGunPart(gx + 4, gy - 11, 9, 11);  // grip
-  drawGunPart(gx + 13, gy - 37, 2, 4);  // front sight post (muzzle end)
-  drawGunPart(gx + 1, gy - 24, 2, 3);   // rear sight, left tab
-  drawGunPart(gx + 6, gy - 24, 2, 3);   // rear sight, right tab (forms the notch)
+
+  drawGunPart(gx + 2, gy - 11, 14, 11);  // grip
+  drawGunPart(gx, gy - 18 + kick, 18, 16); // slide / body
+
+  drawTrapezium(gx, gy - 18 + kick, 14 - kick/2, 18, 8 + round(kick/1.1));
+
+  drawGunPart(gx + 3, gy - 26 + kick, 2, 4);   // rear sight, left tab
+  drawGunPart(gx + 13, gy - 26 + kick, 2, 4);   // rear sight, right tab
+  drawGunPart(gx + 3, gy - 21 + kick, 12, 1);   // rear tab connector
+
+  drawGunPart(gx + 9, gy - 28 + kick/2, 1, 4);  //front bit (iron sight)
+
 
   if (flashTimer > 0) {
-    int16_t fx = gx + 12, fy = gy - 38; // emerges from the barrel tip
+    int16_t fx = gx + 10, fy = gy - 30; // emerges from the barrel tip
     int16_t r = 2 + flashTimer;         // shrinks each frame as flashTimer counts down
 
     // tight halo hugging just the flash, not a big block
-    u8g2.setDrawColor(0);
-    u8g2.drawBox(fx - r - 6, fy - r - 2, (r * 2) + 12, r + r / 2 + 4);
-    u8g2.setDrawColor(1);
+    // u8g2.setDrawColor(0);
+    // u8g2.drawBox(fx - r - 6, fy - r - 2, (r * 2) + 12, r + r / 2 + 4);
+    // u8g2.setDrawColor(1);
 
     // filled diamond burst (two triangles), reads much clearer than thin lines
+    u8g2.setDrawColor(0);
     u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
     u8g2.drawTriangle(fx - r, fy, fx, fy + r / 2, fx + r, fy);
     if (flashTimer > 2) {
