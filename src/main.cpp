@@ -67,6 +67,7 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <math.h>
 
 // ---- Display ----
 // Standard SSD1306 128x64, no reset pin, hardware I2C:
@@ -291,6 +292,7 @@ const int16_t PROGMEM colAngleOffset[128] = {
 #define CHASE_RANGE       1536   // 6 cells
 #define MELEE_RANGE       320    // ~1.25 cells
 #define CHASE_STEP        40
+#define ENEMY_COLLIDE_R   40     // enemy wall clearance radius, Q8 units (prevents sinking into walls)
 
 // ============================================================
 // GAME STATE
@@ -431,10 +433,23 @@ void updateEnemyAI() {
   if (distSq > (int32_t)MELEE_RANGE * MELEE_RANGE) {
     int16_t stepx = (ddx > 0) ? -CHASE_STEP : (ddx < 0 ? CHASE_STEP : 0);
     int16_t stepy = (ddy > 0) ? -CHASE_STEP : (ddy < 0 ? CHASE_STEP : 0);
+
+    // same radius-buffered, axis-separated collision the player uses -
+    // without this the enemy's center point can walk flush up against
+    // (and visually sink into) a wall
     int16_t nx = e.x + stepx;
+    int16_t edgeX = (stepx >= 0) ? ENEMY_COLLIDE_R : -ENEMY_COLLIDE_R;
+    if (!isWall(nx + edgeX, e.y - ENEMY_COLLIDE_R) &&
+        !isWall(nx + edgeX, e.y + ENEMY_COLLIDE_R)) {
+      e.x = nx;
+    }
+
     int16_t ny = e.y + stepy;
-    if (!isWall(nx, e.y)) e.x = nx;
-    if (!isWall(e.x, ny)) e.y = ny;
+    int16_t edgeY = (stepy >= 0) ? ENEMY_COLLIDE_R : -ENEMY_COLLIDE_R;
+    if (!isWall(e.x - ENEMY_COLLIDE_R, ny + edgeY) &&
+        !isWall(e.x + ENEMY_COLLIDE_R, ny + edgeY)) {
+      e.y = ny;
+    }
   } else if (player.hurtCooldown == 0) {
     player.hp -= ENEMY_DAMAGE;
     player.hurtCooldown = HURT_COOLDOWN_FR;
@@ -448,7 +463,7 @@ void updateEnemyAI() {
 void handleFire() {
   if (!btnFire || fireCooldown > 0) return;
   fireCooldown = FIRE_COOLDOWN_FR;
-  gunFlashTimer = 5;
+  gunFlashTimer = 4; // matches recoilCurve's 5 entries (indices 0-4)
   tone(PIN_BUZZER, 1200, 50);
 
   uint16_t wallDist = (uint16_t)zbuffer[64] << 3; // approx wall distance dead ahead
@@ -463,7 +478,7 @@ void handleFire() {
     int32_t ddy = enemies[i].y - player.posY;
     int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
     if (forward <= 0 || forward > MAX_SHOT_RANGE || forward > wallDist) continue;
-    int32_t right = (ddx * sinP - ddy * cosP) >> 8;
+    int32_t right = (ddy * cosP - ddx * sinP) >> 8;
     if (labs(right) < (forward * SHOT_TOLERANCE) / 256) {
       if (forward < bestForward) { bestForward = forward; bestIdx = i; }
     }
@@ -562,7 +577,7 @@ void drawEnemies() {
     int32_t ddy = enemies[i].y - player.posY;
     int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
     if (forward < 32 || forward > MAX_RAY_DIST) continue;
-    int32_t right = (ddx * sinP - ddy * cosP) >> 8;
+    int32_t right = (ddy * cosP - ddx * sinP) >> 8;
 
     int16_t screenX = 64 + (int16_t)((right * SPRITE_PROJ_K) / forward);
     int16_t size = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / forward);
@@ -643,9 +658,12 @@ void drawHUD() {
     u8g2.drawBox(17 + s * 5, 3, 4, 5);
   }
 
-  u8g2.setDrawColor(2);
+  u8g2.setDrawColor(0);
+
   u8g2.drawLine(60, 32, 68, 32);
   u8g2.drawLine(64, 28, 64, 36);
+  u8g2.setDrawColor(1);
+
 }
 
 // draws one gun part with a tight 1px keyline hugging just that
@@ -657,70 +675,62 @@ void drawGunPart(int16_t x, int16_t y, int16_t w, int16_t h) {
   u8g2.drawBox(x, y, w, h);
 }
 
-// ============================================================
-// GUN SPRITE - blocky pistol silhouette, bottom-center, with a
-// front-post + rear-notch iron sight. Each part is outlined with
-// its own tight keyline (see drawGunPart above) rather than one
-// big background rectangle, so it separates cleanly from wall
-// texture without looking like it's floating in a black panel.
-// ============================================================
-void drawTrapezium(int x, int y, int topW, int bottomW, int h)
-{
-    u8g2.setDrawColor(1);
+// draws a filled trapezoid (used for the gun's slide, tapering toward
+// the muzzle, for a bit of pseudo-3D perspective) with a 1px keyline
+// outline so it stays separated from wall texture like the other parts
+void drawTrapezium(int x, int y, int topW, int bottomW, int h) {
+  if (h < 2) h = 2; // guards the i/(h-1) division below
 
-    for (int i = 0; i < h; i++)
-    {
-        int w = bottomW - (bottomW - topW) * i / (h - 1);
-        int left = x + (bottomW - w) / 2;
+  u8g2.setDrawColor(1);
+  for (int i = 0; i < h; i++) {
+    int w = bottomW - (bottomW - topW) * i / (h - 1);
+    int left = x + (bottomW - w) / 2;
+    u8g2.drawHLine(left, y - i, w);
+  }
 
-        u8g2.drawHLine(left, y - i, w);
-    }
+  u8g2.setDrawColor(0);
+  int topLeftX  = x + (bottomW - topW) / 2;
+  int topRightX = topLeftX + topW - 1;
+  int botLeftX  = x;
+  int botRightX = x + bottomW - 1;
 
-    u8g2.setDrawColor(0);
-
-    int topLeftX  = x + (bottomW - topW) / 2;
-    int topRightX = topLeftX + topW - 1;
-
-    int botLeftX  = x;
-    int botRightX = x + bottomW - 1;
-
-    u8g2.drawHLine(topLeftX, y - h + 1, topW);
-    u8g2.drawHLine(botLeftX, y, bottomW);
-    u8g2.drawLine(botLeftX, y, topLeftX, y - h + 1);
-    u8g2.drawLine(botRightX, y, topRightX, y - h + 1);
-    u8g2.setDrawColor(1);
+  u8g2.drawHLine(topLeftX, y - h + 1, topW);
+  u8g2.drawHLine(botLeftX, y, bottomW);
+  u8g2.drawLine(botLeftX, y, topLeftX, y - h + 1);
+  u8g2.drawLine(botRightX, y, topRightX, y - h + 1);
+  u8g2.setDrawColor(1);
 }
 
+// ============================================================
+// GUN SPRITE - blocky pistol silhouette, bottom-center, with a
+// tapered trapezoid slide for some pseudo-3D perspective and a
+// front-post + rear-notch iron sight. Parts use drawGunPart's
+// tight keyline so the gun stays visually separated from wall
+// texture without a big background rectangle behind it.
+// ============================================================
 void drawGun(uint8_t flashTimer) {
-
+  // recoil: sharp kick on the first couple of frames, eased settle back down
   static const int8_t recoilCurve[5] = {0, 6, 8, 8, 2};
-  int16_t kick = recoilCurve[flashTimer > 5 ? 5 : flashTimer];
+  int16_t kick = recoilCurve[flashTimer > 4 ? 4 : flashTimer]; // array has 5 entries (0-4) - clamp matches
   int16_t gx = 55, gy = 64; // bottom-center anchor
 
-
-  drawGunPart(gx + 2, gy - 11, 14, 11);  // grip
+  drawGunPart(gx + 2, gy - 11, 14, 11);    // grip
   drawGunPart(gx, gy - 18 + kick, 18, 16); // slide / body
 
-  drawTrapezium(gx, gy - 18 + kick, 14 - kick/2, 18, 8 + round(kick/1.1));
+  drawTrapezium(gx, gy - 18 + kick, 14 - kick / 2, 18, 8 + round(kick / 1.1));
 
-  drawGunPart(gx + 3, gy - 26 + kick, 2, 4);   // rear sight, left tab
+  drawGunPart(gx + 3, gy - 26 + kick, 2, 4);    // rear sight, left tab
   drawGunPart(gx + 13, gy - 26 + kick, 2, 4);   // rear sight, right tab
   drawGunPart(gx + 3, gy - 21 + kick, 12, 1);   // rear tab connector
 
-  drawGunPart(gx + 9, gy - 28 + kick/2, 1, 4);  //front bit (iron sight)
-
+  drawGunPart(gx + 9, gy - 28 + kick / 2, 1, 4); // front bit (iron sight)
 
   if (flashTimer > 0) {
     int16_t fx = gx + 10, fy = gy - 30; // emerges from the barrel tip
     int16_t r = 2 + flashTimer;         // shrinks each frame as flashTimer counts down
 
-    // tight halo hugging just the flash, not a big block
-    // u8g2.setDrawColor(0);
-    // u8g2.drawBox(fx - r - 6, fy - r - 2, (r * 2) + 12, r + r / 2 + 4);
-    // u8g2.setDrawColor(1);
-
     // filled diamond burst (two triangles), reads much clearer than thin lines
-    u8g2.setDrawColor(0);
+    u8g2.setDrawColor(0); // must be color 1 here, or the flash draws invisibly (erase mode)
     u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
     u8g2.drawTriangle(fx - r, fy, fx, fy + r / 2, fx + r, fy);
     if (flashTimer > 2) {
