@@ -82,6 +82,10 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 #define PIN_BTN_FORWARD 4
 #define PIN_BTN_FIRE    5
 #define PIN_BUZZER      9
+#define LED_PIN_FIRE    6
+#define LED_PIN_DMG     7
+#define LED_PIN_WIN     11
+#define LED_PIN_LOSE    12 
 
 // ============================================================
 // MAP  (16x16, 1 = wall, 0 = floor. Verified solvable/connected
@@ -349,6 +353,10 @@ void setup() {
   pinMode(PIN_BTN_RIGHT, INPUT_PULLUP);
   pinMode(PIN_BTN_FORWARD, INPUT_PULLUP);
   pinMode(PIN_BTN_FIRE, INPUT_PULLUP);
+  pinMode(LED_PIN_DMG, OUTPUT);
+  pinMode(LED_PIN_FIRE, OUTPUT);
+  pinMode(LED_PIN_WIN, OUTPUT);
+  pinMode(LED_PIN_LOSE, OUTPUT);
 
   u8g2.setBusClock(400000); // 400kHz I2C - much faster frame pushes than default 100kHz
   u8g2.begin();
@@ -359,6 +367,10 @@ void setup() {
 }
 
 void resetGame() {
+  digitalWrite(LED_PIN_LOSE, LOW);
+  digitalWrite(LED_PIN_WIN, LOW);
+  digitalWrite(LED_PIN_DMG, LOW);
+
   player.posX = START_X * FP_ONE + FP_ONE / 2;
   player.posY = START_Y * FP_ONE + FP_ONE / 2;
   player.angle = 0;
@@ -453,8 +465,14 @@ void updateEnemyAI() {
   } else if (player.hurtCooldown == 0) {
     player.hp -= ENEMY_DAMAGE;
     player.hurtCooldown = HURT_COOLDOWN_FR;
+
+    digitalWrite(LED_PIN_DMG, HIGH);
     tone(PIN_BUZZER, 150, 100);
+    delay(150);  //stun
+    digitalWrite(LED_PIN_DMG, LOW);
+
   }
+  
 }
 
 // ============================================================
@@ -464,7 +482,9 @@ void handleFire() {
   if (!btnFire || fireCooldown > 0) return;
   fireCooldown = FIRE_COOLDOWN_FR;
   gunFlashTimer = 4; // matches recoilCurve's 5 entries (indices 0-4)
+  digitalWrite(LED_PIN_FIRE, HIGH);
   tone(PIN_BUZZER, 1200, 50);
+  
 
   uint16_t wallDist = (uint16_t)zbuffer[64] << 3; // approx wall distance dead ahead
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
@@ -709,13 +729,12 @@ void drawTrapezium(int x, int y, int topW, int bottomW, int h) {
 // texture without a big background rectangle behind it.
 // ============================================================
 void drawGun(uint8_t flashTimer) {
-  // recoil: sharp kick on the first couple of frames, eased settle back down
   static const int8_t recoilCurve[5] = {0, 6, 8, 8, 2};
   int16_t kick = recoilCurve[flashTimer > 4 ? 4 : flashTimer]; // array has 5 entries (0-4) - clamp matches
   int16_t gx = 55, gy = 64; // bottom-center anchor
 
   drawGunPart(gx + 2, gy - 11, 14, 11);    // grip
-  drawGunPart(gx, gy - 18 + kick, 18, 16); // slide / body
+  drawGunPart(gx, gy - 18 + kick, 18, 16); // body
 
   drawTrapezium(gx, gy - 18 + kick, 14 - kick / 2, 18, 8 + round(kick / 1.1));
 
@@ -726,11 +745,10 @@ void drawGun(uint8_t flashTimer) {
   drawGunPart(gx + 9, gy - 28 + kick / 2, 1, 4); // front bit (iron sight)
 
   if (flashTimer > 0) {
-    int16_t fx = gx + 10, fy = gy - 30; // emerges from the barrel tip
-    int16_t r = 2 + flashTimer;         // shrinks each frame as flashTimer counts down
+    int16_t fx = gx + 10, fy = gy - 30;
+    int16_t r = 2 + flashTimer;
 
-    // filled diamond burst (two triangles), reads much clearer than thin lines
-    u8g2.setDrawColor(0); // must be color 1 here, or the flash draws invisibly (erase mode)
+    u8g2.setDrawColor(0);
     u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
     u8g2.drawTriangle(fx - r, fy, fx, fy + r / 2, fx + r, fy);
     if (flashTimer > 2) {
@@ -738,6 +756,9 @@ void drawGun(uint8_t flashTimer) {
       u8g2.drawLine(fx + r + 2, fy - 2, fx + r + 5, fy - 4);
     }
   }
+  if (flashTimer == 0) {
+      digitalWrite(LED_PIN_FIRE, LOW);
+    }
 }
 
 // ============================================================
@@ -747,6 +768,7 @@ void checkWinLose() {
   if (player.hp <= 0) {
     gameState = ST_LOSE;
     stateEnterGuard = 20;
+    digitalWrite(LED_PIN_LOSE, HIGH);
     tone(PIN_BUZZER, 100, 500);
     return;
   }
@@ -757,6 +779,7 @@ void checkWinLose() {
   if (ddx * ddx + ddy * ddy < (int32_t)200 * 200) {
     gameState = ST_WIN;
     stateEnterGuard = 20;
+    digitalWrite(LED_PIN_WIN, HIGH);
     tone(PIN_BUZZER, 1500, 300);
   }
 }
