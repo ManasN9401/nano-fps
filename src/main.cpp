@@ -85,7 +85,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 #define LED_PIN_FIRE    6
 #define LED_PIN_DMG     7
 #define LED_PIN_WIN     11
-#define LED_PIN_LOSE    12 
+#define LED_PIN_LOSE    12
 
 // ============================================================
 // MAP  (16x16, 1 = wall, 0 = floor. Verified solvable/connected
@@ -118,8 +118,9 @@ const uint16_t PROGMEM mapData[MAP_SIZE] = {
 #define EXIT_Y  13
 
 #define NUM_ENEMIES 4
-const int16_t enemyStartX[NUM_ENEMIES] = {13, 1, 9, 8};
-const int16_t enemyStartY[NUM_ENEMIES] = { 5, 9, 2, 5};
+const int16_t enemyStartX[NUM_ENEMIES]  = {13, 1, 9, 8};
+const int16_t enemyStartY[NUM_ENEMIES]  = { 5, 9, 2, 5};
+const bool    enemyIsRanged[NUM_ENEMIES] = {true, false, true, false};
 
 // ============================================================
 // TRIG TABLES - Q8 fixed point (value = table/256), 1024 steps
@@ -275,11 +276,11 @@ const int16_t PROGMEM colAngleOffset[128] = {
 // GAME CONSTANTS (tune these after your first test flash)
 // ============================================================
 #define FP_ONE          256      // Q8 fixed point: 1 map cell = 256
-#define MOVE_SPEED      12       // player move speed, Q8 units/frame
-#define TURN_SPEED      10       // player turn speed, angle units/frame (of 1024)
+#define MOVE_SPEED      18       // player move speed, Q8 units/frame (bumped up - was 12)
+#define TURN_SPEED      15       // player turn speed, angle units/frame of 1024 (bumped up - was 10)
 #define COLLIDE_R       50       // player collision radius, Q8 units
-#define RAY_STEP        28       // raycast march step, Q8 units
-#define MAX_RAY_DIST    2560     // max ray length, Q8 units (10 cells)
+#define RAY_STEP        36       // raycast march step, Q8 units (was 28 - fewer steps/ray = more spare CPU per frame)
+#define MAX_RAY_DIST    2304     // max ray length, Q8 units (9 cells, was 10 - trims worst-case ray length a bit)
 #define WALL_HEIGHT_K   70       // projection constant for wall height
 #define NEAR_SHADE_DIST 1024     // start light dithering beyond 4 cells
 #define FAR_SHADE_DIST  1792     // heavy dithering beyond 7 cells
@@ -297,6 +298,15 @@ const int16_t PROGMEM colAngleOffset[128] = {
 #define MELEE_RANGE       320    // ~1.25 cells
 #define CHASE_STEP        40
 #define ENEMY_COLLIDE_R   40     // enemy wall clearance radius, Q8 units (prevents sinking into walls)
+#define RANGED_RANGE      2048   // 8 cells - how far a ranged enemy can see/shoot
+#define RANGED_DAMAGE     6
+#define LOS_STEP          32     // line-of-sight ray march step, Q8 units
+#define LOS_MAX_STEPS     48     // safety cap on line-of-sight march iterations
+
+#define MAG_SIZE          6      // shots per magazine (kept <= 9 - HUD digit code assumes single digit)
+#define RELOAD_FRAMES     50     // how long a reload takes, in frames
+#define RELOAD_MAX_DIP    50     // how far the gun drops off-screen mid-reload, in pixels
+#define DMG_LED_FRAMES    5      // how long the damage LED stays lit (non-blocking, no delay())
 
 // ============================================================
 // GAME STATE
@@ -313,10 +323,12 @@ struct Player {
 Player player;
 
 struct Enemy {
-  int16_t x, y;    // Q8 world position
+  int16_t x, y;      // Q8 world position
   int8_t  hp;
   bool    alive;
-  uint8_t hitFlash; // frames remaining of "just got shot" hatch flash
+  bool    isRanged;
+  uint8_t hitFlash;   // frames remaining of "just got shot" hatch flash
+  uint8_t shootFlash; // frames remaining of "just fired at you" muzzle flash (ranged only)
 };
 Enemy enemies[NUM_ENEMIES];
 uint8_t aiTurn = 0;
@@ -327,6 +339,12 @@ uint8_t gunFlashTimer = 0;   // frames remaining of muzzle-flash/recoil animatio
 uint8_t frameCount = 0;      // free-running counter, used for flash/hatch patterns
 bool btnLeft, btnRight, btnForward, btnFire, prevFireMenu = false;
 uint8_t stateEnterGuard = 0; // ignore fire briefly after entering a menu state
+
+uint8_t ammoInMag = MAG_SIZE;
+bool reloading = false;
+uint8_t reloadTimer = 0;
+uint8_t dmgLedTimer = 0;     // non-blocking replacement for the old delay()-based "stun" LED
+uint8_t killCount = 0;
 
 static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
   if (v < lo) return lo;
@@ -343,6 +361,29 @@ bool isWall(int16_t x, int16_t y) {
   if (cx < 0 || cx >= MAP_SIZE || cy < 0 || cy >= MAP_SIZE) return true;
   uint16_t row = pgm_read_word(&mapData[cy]);
   return (row >> (15 - cx)) & 1;
+}
+
+// Cheap line-of-sight ray march between two world points - avoids sqrt by
+// stepping a fixed number of times based on the larger axis delta. Only
+// ever called once per frame at most (one enemy's AI turn), so its cost
+// is comparable to a single column of wall raycasting - negligible.
+bool hasLineOfSight(int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+  int16_t dx = x2 - x1, dy = y2 - y1;
+  int16_t adx = dx < 0 ? -dx : dx;
+  int16_t ady = dy < 0 ? -dy : dy;
+  int16_t span = (adx > ady) ? adx : ady;
+  int16_t steps = span / LOS_STEP + 1;
+  if (steps > LOS_MAX_STEPS) steps = LOS_MAX_STEPS;
+
+  int16_t stepX = dx / steps;
+  int16_t stepY = dy / steps;
+  int16_t x = x1, y = y1;
+  for (int16_t i = 0; i < steps; i++) {
+    x += stepX;
+    y += stepY;
+    if (isWall(x, y)) return false;
+  }
+  return true;
 }
 
 // ============================================================
@@ -370,6 +411,7 @@ void resetGame() {
   digitalWrite(LED_PIN_LOSE, LOW);
   digitalWrite(LED_PIN_WIN, LOW);
   digitalWrite(LED_PIN_DMG, LOW);
+  digitalWrite(LED_PIN_FIRE, LOW);
 
   player.posX = START_X * FP_ONE + FP_ONE / 2;
   player.posY = START_Y * FP_ONE + FP_ONE / 2;
@@ -382,10 +424,17 @@ void resetGame() {
     enemies[i].y = enemyStartY[i] * FP_ONE + FP_ONE / 2;
     enemies[i].hp = ENEMY_MAX_HP;
     enemies[i].alive = true;
+    enemies[i].isRanged = enemyIsRanged[i];
     enemies[i].hitFlash = 0;
+    enemies[i].shootFlash = 0;
   }
   gunFlashTimer = 0;
   frameCount = 0;
+  ammoInMag = MAG_SIZE;
+  reloading = false;
+  reloadTimer = 0;
+  dmgLedTimer = 0;
+  killCount = 0;
 }
 
 // ============================================================
@@ -440,6 +489,23 @@ void updateEnemyAI() {
   int32_t ddy = (int32_t)e.y - player.posY;
   int32_t distSq = ddx * ddx + ddy * ddy;
 
+  if (e.isRanged) {
+    // stationary turret: doesn't chase, just shoots when it has a clear
+    // shot within range. Line-of-sight is what actually gates it, so
+    // it never fires through a wall.
+    if (distSq <= (int32_t)RANGED_RANGE * RANGED_RANGE &&
+        player.hurtCooldown == 0 &&
+        hasLineOfSight(e.x, e.y, player.posX, player.posY)) {
+      player.hp -= RANGED_DAMAGE;
+      player.hurtCooldown = HURT_COOLDOWN_FR;
+      e.shootFlash = 6;
+      digitalWrite(LED_PIN_DMG, HIGH);
+      dmgLedTimer = DMG_LED_FRAMES;
+      tone(PIN_BUZZER, 400, 80); // distinct pitch from melee's growl and your own gun
+    }
+    return;
+  }
+
   if (distSq > (int32_t)CHASE_RANGE * CHASE_RANGE) return;
 
   if (distSq > (int32_t)MELEE_RANGE * MELEE_RANGE) {
@@ -465,26 +531,47 @@ void updateEnemyAI() {
   } else if (player.hurtCooldown == 0) {
     player.hp -= ENEMY_DAMAGE;
     player.hurtCooldown = HURT_COOLDOWN_FR;
-
     digitalWrite(LED_PIN_DMG, HIGH);
+    dmgLedTimer = DMG_LED_FRAMES; // ticked down in the main loop, no delay() needed
     tone(PIN_BUZZER, 150, 100);
-    delay(150);  //stun
-    digitalWrite(LED_PIN_DMG, LOW);
-
   }
-  
+}
+
+// ============================================================
+// AMMO / RELOAD
+// ============================================================
+void startReload() {
+  reloading = true;
+  reloadTimer = RELOAD_FRAMES;
+  tone(PIN_BUZZER, 300, 80);
+}
+
+// gun's vertical drop during reload: dips down (gun leaves the screen),
+// then eases back up, forming a simple down-and-up dip animation
+int16_t getReloadOffset() {
+  if (!reloading) return 0;
+  uint8_t half = RELOAD_FRAMES / 2;
+  if (reloadTimer > half) {
+    uint8_t elapsed = RELOAD_FRAMES - reloadTimer; // 0 -> half, going down
+    return (int16_t)(((int32_t)elapsed * RELOAD_MAX_DIP) / half);
+  } else {
+    return (int16_t)(((int32_t)reloadTimer * RELOAD_MAX_DIP) / half); // half -> 0, coming up
+  }
 }
 
 // ============================================================
 // COMBAT
 // ============================================================
 void handleFire() {
+  if (reloading) return;
   if (!btnFire || fireCooldown > 0) return;
+  if (ammoInMag == 0) { startReload(); return; }
+
   fireCooldown = FIRE_COOLDOWN_FR;
+  ammoInMag--;
   gunFlashTimer = 4; // matches recoilCurve's 5 entries (indices 0-4)
   digitalWrite(LED_PIN_FIRE, HIGH);
   tone(PIN_BUZZER, 1200, 50);
-  
 
   uint16_t wallDist = (uint16_t)zbuffer[64] << 3; // approx wall distance dead ahead
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
@@ -508,8 +595,13 @@ void handleFire() {
     enemies[bestIdx].hp -= SHOT_DAMAGE;
     enemies[bestIdx].hitFlash = 8;
     tone(PIN_BUZZER, 600, 40);
-    if (enemies[bestIdx].hp <= 0) enemies[bestIdx].alive = false;
+    if (enemies[bestIdx].hp <= 0) {
+      enemies[bestIdx].alive = false;
+      killCount++;
+    }
   }
+
+  if (ammoInMag == 0) startReload(); // auto-reload once the mag is empty
 }
 
 // ============================================================
@@ -586,6 +678,13 @@ void castAndDrawWalls() {
 // is behind it, and (2) the shape is a head+body silhouette
 // instead of a flat box, so it doesn't read as "just another
 // wall segment". A hatch pattern flashes briefly on a landed hit.
+//
+// Ranged enemies are told apart from melee ones by SHAPE, not
+// color (impossible to do reliably on this display): a square
+// head instead of round, plus a weapon nub sticking out to the
+// side. When they fire, a small muzzle-flash burst appears on
+// them too - the temporal cue reads far more clearly than any
+// static color difference could.
 // ============================================================
 void drawEnemies() {
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
@@ -593,8 +692,9 @@ void drawEnemies() {
 
   for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
     if (!enemies[i].alive) continue;
-    int32_t ddx = enemies[i].x - player.posX;
-    int32_t ddy = enemies[i].y - player.posY;
+    Enemy &e = enemies[i];
+    int32_t ddx = e.x - player.posX;
+    int32_t ddy = e.y - player.posY;
     int32_t forward = (ddx * cosP + ddy * sinP) >> 8;
     if (forward < 32 || forward > MAX_RAY_DIST) continue;
     int32_t right = (ddy * cosP - ddx * sinP) >> 8;
@@ -609,13 +709,18 @@ void drawEnemies() {
     int16_t bodyBottom = 32 + size / 2;
     int16_t headCY     = bodyTop - headR;
     int16_t spriteTop  = headCY - headR;
+    int16_t nubW        = e.isRanged ? (size / 4 + 2) : 0; // weapon nub width, ranged only
 
-    int16_t left  = screenX - halfW;
-    int16_t rightCol = screenX + halfW;
+    int16_t bodyLeft  = screenX - halfW;
+    int16_t bodyRight = screenX + halfW;
+    int16_t left      = bodyLeft;
+    int16_t rightCol  = bodyRight + nubW; // widen bounds to cover the nub
     if (rightCol < 0 || left > 127) continue;
 
     int16_t clampedLeft  = clampi(left, 0, 127);
     int16_t clampedRight = clampi(rightCol, 0, 127);
+    int16_t bClampedLeft  = clampi(bodyLeft, 0, 127);
+    int16_t bClampedRight = clampi(bodyRight, 0, 127);
 
     uint8_t fdist8 = (forward >> 3 > 255) ? 255 : (uint8_t)(forward >> 3);
 
@@ -626,8 +731,9 @@ void drawEnemies() {
     }
     if (!anyVisible) continue;
 
-    // halo: erase a 1px black border around the sprite's bounding box so
-    // it always has contrast against whatever wall pixels sit behind it
+    // halo: erase a 1px black border around the sprite's bounding box
+    // (including the nub) so it always has contrast against whatever
+    // wall pixels sit behind it
     int16_t hx = clampi(left - 1, 0, 127);
     int16_t hy = clampi(spriteTop - 1, 0, 63);
     int16_t hw = clampi(rightCol + 1, 0, 127) - hx + 1;
@@ -638,18 +744,41 @@ void drawEnemies() {
       u8g2.setDrawColor(1);
     }
 
-    bool flash = enemies[i].hitFlash > 0;
+    bool flash = e.hitFlash > 0;
 
     // body
-    for (int16_t col = clampedLeft; col <= clampedRight; col++) {
+    for (int16_t col = bClampedLeft; col <= bClampedRight; col++) {
       if (zbuffer[col] <= fdist8) continue; // occluded by a nearer wall
       if (flash && ((col + frameCount) & 1)) continue; // hatched while flashing
       u8g2.drawVLine(col, bodyTop, bodyBottom - bodyTop + 1);
     }
-    // head - a circle reads as a creature, not a wall segment
+
+    // head - round for melee ("just a creature"), square for ranged
+    // ("armed and dangerous") - a shape cue works regardless of panel color
     if (!flash || !(frameCount & 1)) {
-      if (screenX >= clampedLeft - headR && screenX <= clampedRight + headR) {
-        u8g2.drawDisc(screenX, headCY, headR);
+      if (screenX >= bClampedLeft - headR && screenX <= bClampedRight + headR) {
+        if (e.isRanged) {
+          u8g2.drawBox(screenX - headR, headCY - headR, headR * 2, headR * 2);
+        } else {
+          u8g2.drawDisc(screenX, headCY, headR);
+        }
+      }
+    }
+
+    if (e.isRanged) {
+      // weapon nub sticking out from the body
+      int16_t nubX = bodyRight;
+      int16_t nubY = bodyTop + size / 4;
+      if (nubX >= clampedLeft && nubX <= clampedRight) {
+        u8g2.drawBox(nubX, nubY, nubW, 2);
+      }
+      // muzzle flash burst when it fires - motion is a far stronger cue
+      // than any static color difference could be
+      if (e.shootFlash > 0) {
+        int16_t fx = nubX + nubW, fy = nubY + 1;
+        int16_t r = 2 + (e.shootFlash > 3 ? 3 : e.shootFlash);
+        u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
+        u8g2.drawTriangle(fx - r, fy, fx, fy + r / 2, fx + r, fy);
       }
     }
   }
@@ -684,6 +813,37 @@ void drawHUD() {
   u8g2.drawLine(64, 28, 64, 36);
   u8g2.setDrawColor(1);
 
+}
+
+// ============================================================
+// AMMO HUD - top right. Shows "N/MAG" while armed, and a
+// blinking "RELD" while reloading.
+// ============================================================
+void drawAmmoHUD() {
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(94, 0, 34, 12);
+  u8g2.setDrawColor(1);
+
+  if (reloading) {
+    if (frameCount & 4) u8g2.drawStr(96, 9, "RELD");
+  } else {
+    // single-digit ammo/magsize only (MAG_SIZE is defined <= 9) -
+    // avoids pulling in sprintf/String just to show two digits
+    char buf[4] = { (char)('0' + ammoInMag), '/', (char)('0' + MAG_SIZE), '\0' };
+    u8g2.drawStr(100, 9, buf);
+  }
+}
+
+// ============================================================
+// KILL COUNTER HUD - bottom left, clear of the gun sprite.
+// ============================================================
+void drawKillHUD() {
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(0, 52, 34, 12);
+  u8g2.setDrawColor(1);
+  // single-digit kill count / enemy total only (NUM_ENEMIES is <= 9)
+  char buf[6] = { 'K', ':', (char)('0' + killCount), '/', (char)('0' + NUM_ENEMIES), '\0' };
+  u8g2.drawStr(2, 61, buf);
 }
 
 // draws one gun part with a tight 1px keyline hugging just that
@@ -728,13 +888,14 @@ void drawTrapezium(int x, int y, int topW, int bottomW, int h) {
 // tight keyline so the gun stays visually separated from wall
 // texture without a big background rectangle behind it.
 // ============================================================
-void drawGun(uint8_t flashTimer) {
+void drawGun(uint8_t flashTimer, int16_t reloadOffset) {
+  // recoil: sharp kick on the first couple of frames, eased settle back down
   static const int8_t recoilCurve[5] = {0, 6, 8, 8, 2};
   int16_t kick = recoilCurve[flashTimer > 4 ? 4 : flashTimer]; // array has 5 entries (0-4) - clamp matches
-  int16_t gx = 55, gy = 64; // bottom-center anchor
+  int16_t gx = 55, gy = 64 + reloadOffset; // bottom-center anchor, dips down during reload
 
   drawGunPart(gx + 2, gy - 11, 14, 11);    // grip
-  drawGunPart(gx, gy - 18 + kick, 18, 16); // body
+  drawGunPart(gx, gy - 18 + kick, 18, 16); // slide / body
 
   drawTrapezium(gx, gy - 18 + kick, 14 - kick / 2, 18, 8 + round(kick / 1.1));
 
@@ -817,14 +978,29 @@ void loop() {
       if (player.hurtCooldown > 0) player.hurtCooldown--;
       for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
         if (enemies[i].hitFlash > 0) enemies[i].hitFlash--;
+        if (enemies[i].shootFlash > 0) enemies[i].shootFlash--;
+      }
+      if (dmgLedTimer > 0) {
+        dmgLedTimer--;
+        if (dmgLedTimer == 0) digitalWrite(LED_PIN_DMG, LOW);
+      }
+      if (reloading) {
+        reloadTimer--;
+        if (reloadTimer == 0) {
+          reloading = false;
+          ammoInMag = MAG_SIZE;
+          tone(PIN_BUZZER, 700, 100);
+        }
       }
 
       u8g2.clearBuffer();
       castAndDrawWalls();
       handleFire();       // uses zbuffer from castAndDrawWalls, run after
       drawEnemies();
-      drawGun(gunFlashTimer);
+      drawGun(gunFlashTimer, getReloadOffset());
       drawHUD();
+      drawAmmoHUD();
+      drawKillHUD();
       u8g2.sendBuffer();
 
       checkWinLose();
@@ -834,7 +1010,13 @@ void loop() {
     case ST_WIN: {
       u8g2.clearBuffer();
       u8g2.drawStr(24, 28, "YOU ESCAPED!");
-      u8g2.drawStr(14, 44, "FIRE for title");
+      {
+        char buf[16] = "ENEMIES: 0/0";
+        buf[9] = (char)('0' + killCount);
+        buf[11] = (char)('0' + NUM_ENEMIES);
+        u8g2.drawStr(20, 40, buf);
+      }
+      u8g2.drawStr(14, 54, "FIRE for title");
       u8g2.sendBuffer();
       if (fireJustPressed && stateEnterGuard == 0) {
         gameState = ST_TITLE;
@@ -846,7 +1028,13 @@ void loop() {
     case ST_LOSE: {
       u8g2.clearBuffer();
       u8g2.drawStr(30, 28, "GAME OVER");
-      u8g2.drawStr(14, 44, "FIRE for title");
+      {
+        char buf[16] = "ENEMIES: 0/0";
+        buf[9] = (char)('0' + killCount);
+        buf[11] = (char)('0' + NUM_ENEMIES);
+        u8g2.drawStr(20, 40, buf);
+      }
+      u8g2.drawStr(14, 54, "FIRE for title");
       u8g2.sendBuffer();
       if (fireJustPressed && stateEnterGuard == 0) {
         gameState = ST_TITLE;
