@@ -118,9 +118,9 @@ const uint16_t PROGMEM mapData[MAP_SIZE] = {
 #define EXIT_Y  13
 
 #define NUM_ENEMIES 4
-const int16_t enemyStartX[NUM_ENEMIES]  = {13, 1, 9, 8};
-const int16_t enemyStartY[NUM_ENEMIES]  = { 5, 9, 2, 5};
-const bool    enemyIsRanged[NUM_ENEMIES] = {true, false, true, false};
+const int16_t enemyStartX[NUM_ENEMIES]  PROGMEM = {13, 1, 9, 8};
+const int16_t enemyStartY[NUM_ENEMIES]  PROGMEM = { 5, 9, 2, 5};
+const bool    enemyIsRanged[NUM_ENEMIES] PROGMEM = {true, false, true, false};
 
 // ============================================================
 // TRIG TABLES - Q8 fixed point (value = table/256), 1024 steps
@@ -281,6 +281,8 @@ const int16_t PROGMEM colAngleOffset[128] = {
 #define COLLIDE_R       50       // player collision radius, Q8 units
 #define RAY_STEP        36       // raycast march step, Q8 units (was 28 - fewer steps/ray = more spare CPU per frame)
 #define MAX_RAY_DIST    2304     // max ray length, Q8 units (9 cells, was 10 - trims worst-case ray length a bit)
+#define NUM_RAY_COLS    64       // rays cast per frame (was 128) - each drawn as a 2px-wide strip.
+                                  // Halves both the zbuffer's RAM and the raycasting loop's CPU cost.
 #define WALL_HEIGHT_K   70       // projection constant for wall height
 #define NEAR_SHADE_DIST 1024     // start light dithering beyond 4 cells
 #define FAR_SHADE_DIST  1792     // heavy dithering beyond 7 cells
@@ -333,7 +335,7 @@ struct Enemy {
 Enemy enemies[NUM_ENEMIES];
 uint8_t aiTurn = 0;
 
-uint8_t zbuffer[128];        // per-column wall distance (>>3), for sprite occlusion
+uint8_t zbuffer[NUM_RAY_COLS]; // per-ray wall distance (>>3), for sprite occlusion
 uint8_t fireCooldown = 0;
 uint8_t gunFlashTimer = 0;   // frames remaining of muzzle-flash/recoil animation
 uint8_t frameCount = 0;      // free-running counter, used for flash/hatch patterns
@@ -344,12 +346,20 @@ uint8_t ammoInMag = MAG_SIZE;
 bool reloading = false;
 uint8_t reloadTimer = 0;
 uint8_t dmgLedTimer = 0;     // non-blocking replacement for the old delay()-based "stun" LED
+uint8_t hitMarkerTimer = 0;  // frames remaining of the "shot landed" crosshair flash
 uint8_t killCount = 0;
 
 static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
+}
+
+// zbuffer is indexed by ray (0-63), but sprite/HUD code thinks in screen
+// columns (0-127) since each ray covers a 2px-wide strip - this is the
+// one place that conversion happens.
+static inline uint8_t zbAt(int16_t screenX) {
+  return zbuffer[screenX >> 1];
 }
 
 // ============================================================
@@ -420,11 +430,11 @@ void resetGame() {
   player.hurtCooldown = 0;
   fireCooldown = 0;
   for (uint8_t i = 0; i < NUM_ENEMIES; i++) {
-    enemies[i].x = enemyStartX[i] * FP_ONE + FP_ONE / 2;
-    enemies[i].y = enemyStartY[i] * FP_ONE + FP_ONE / 2;
+    enemies[i].x = (int16_t)pgm_read_word(&enemyStartX[i]) * FP_ONE + FP_ONE / 2;
+    enemies[i].y = (int16_t)pgm_read_word(&enemyStartY[i]) * FP_ONE + FP_ONE / 2;
     enemies[i].hp = ENEMY_MAX_HP;
     enemies[i].alive = true;
-    enemies[i].isRanged = enemyIsRanged[i];
+    enemies[i].isRanged = pgm_read_byte(&enemyIsRanged[i]) != 0;
     enemies[i].hitFlash = 0;
     enemies[i].shootFlash = 0;
   }
@@ -573,7 +583,7 @@ void handleFire() {
   digitalWrite(LED_PIN_FIRE, HIGH);
   tone(PIN_BUZZER, 1200, 50);
 
-  uint16_t wallDist = (uint16_t)zbuffer[64] << 3; // approx wall distance dead ahead
+  uint16_t wallDist = (uint16_t)zbAt(64) << 3; // approx wall distance dead ahead
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
   int16_t sinP = pgm_read_word(&sinTable[player.angle]);
 
@@ -594,6 +604,7 @@ void handleFire() {
   if (bestIdx >= 0) {
     enemies[bestIdx].hp -= SHOT_DAMAGE;
     enemies[bestIdx].hitFlash = 8;
+    hitMarkerTimer = 6;
     tone(PIN_BUZZER, 600, 40);
     if (enemies[bestIdx].hp <= 0) {
       enemies[bestIdx].alive = false;
@@ -617,7 +628,9 @@ void handleFire() {
 // solid drawVLine, not more.
 // ============================================================
 void castAndDrawWalls() {
-  for (uint8_t col = 0; col < 128; col++) {
+  for (uint8_t rc = 0; rc < NUM_RAY_COLS; rc++) {
+    uint8_t col = rc * 2; // sample every other entry of the 128-entry angle table -
+                          // still evenly spaced across the FOV, just half as many rays
     int16_t rayAngle = (player.angle + (int16_t)pgm_read_word(&colAngleOffset[col])) & 1023;
     int16_t dx = pgm_read_word(&cosTable[rayAngle]);
     int16_t dy = pgm_read_word(&sinTable[rayAngle]);
@@ -637,7 +650,7 @@ void castAndDrawWalls() {
       prevCx = curCx;
     }
 
-    if (!hit) { zbuffer[col] = 255; continue; } // nothing there, leave column blank
+    if (!hit) { zbuffer[rc] = 255; continue; } // nothing there, leave column blank
 
     int16_t relAngle = (rayAngle - player.angle) & 1023;
     int16_t cosRel = pgm_read_word(&cosTable[relAngle]);
@@ -645,7 +658,7 @@ void castAndDrawWalls() {
 
     int32_t correctedDist = ((int32_t)dist * cosRel) >> 8;
     if (correctedDist < 16) correctedDist = 16;
-    zbuffer[col] = (correctedDist >> 3 > 255) ? 255 : (uint8_t)(correctedDist >> 3);
+    zbuffer[rc] = (correctedDist >> 3 > 255) ? 255 : (uint8_t)(correctedDist >> 3);
 
     int16_t wallH = (int16_t)(((int32_t)WALL_HEIGHT_K << 8) / correctedDist);
     if (wallH > 160) wallH = 160;
@@ -655,15 +668,16 @@ void castAndDrawWalls() {
     if (bottom > 63) bottom = 63;
 
     if (correctedDist > FAR_SHADE_DIST) {
-      for (int16_t y = top; y <= bottom; y += 3) u8g2.drawPixel(col, y);
+      for (int16_t y = top; y <= bottom; y += 3) { u8g2.drawPixel(col, y); u8g2.drawPixel(col + 1, y); }
     } else if (correctedDist > NEAR_SHADE_DIST) {
-      for (int16_t y = top; y <= bottom; y += 2) u8g2.drawPixel(col, y);
+      for (int16_t y = top; y <= bottom; y += 2) { u8g2.drawPixel(col, y); u8g2.drawPixel(col + 1, y); }
     } else if (sideVertical) {
       for (int16_t y = top; y <= bottom; y++) {
-        if (((y - top) & 3) != 3) u8g2.drawPixel(col, y); // mortar line every 4th row
+        if (((y - top) & 3) != 3) { u8g2.drawPixel(col, y); u8g2.drawPixel(col + 1, y); } // mortar line every 4th row
       }
     } else {
       u8g2.drawVLine(col, top, bottom - top + 1);
+      u8g2.drawVLine(col + 1, top, bottom - top + 1);
     }
   }
 }
@@ -673,18 +687,19 @@ void castAndDrawWalls() {
 //
 // On a 1-bit screen a plain silhouette box can visually merge
 // into a solid wall column right behind it. Two fixes are used
-// here: (1) a black "keyline" halo is erased around the sprite
-// first, so there's always a gap between the enemy and whatever
-// is behind it, and (2) the shape is a head+body silhouette
-// instead of a flat box, so it doesn't read as "just another
-// wall segment". A hatch pattern flashes briefly on a landed hit.
+// here: (1) a 2px black "keyline" halo is erased around the
+// sprite first, so there's always a clear gap between the enemy
+// and whatever is behind it, and (2) the shape is a head+body
+// silhouette instead of a flat box, so it doesn't read as "just
+// another wall segment". A hatch pattern flashes briefly on a
+// landed hit.
 //
 // Ranged enemies are told apart from melee ones by SHAPE, not
 // color (impossible to do reliably on this display): a square
-// head instead of round, plus a weapon nub sticking out to the
-// side. When they fire, a small muzzle-flash burst appears on
-// them too - the temporal cue reads far more clearly than any
-// static color difference could.
+// head, a persistent blinking "sensor light" above it, and a
+// bigger weapon nub - all visible at all times, not just in the
+// moment they fire. When they do fire, a tracer line connects
+// the shot back to them so you learn to recognize the source.
 // ============================================================
 void drawEnemies() {
   int16_t cosP = pgm_read_word(&cosTable[player.angle]);
@@ -709,7 +724,8 @@ void drawEnemies() {
     int16_t bodyBottom = 32 + size / 2;
     int16_t headCY     = bodyTop - headR;
     int16_t spriteTop  = headCY - headR;
-    int16_t nubW        = e.isRanged ? (size / 4 + 2) : 0; // weapon nub width, ranged only
+    int16_t nubW        = e.isRanged ? (size / 3 + 3) : 0; // weapon nub, bigger/more obvious now
+    int16_t topMargin   = e.isRanged ? 4 : 0;               // extra room above head for the sensor light
 
     int16_t bodyLeft  = screenX - halfW;
     int16_t bodyRight = screenX + halfW;
@@ -727,17 +743,17 @@ void drawEnemies() {
     // skip entirely if every column is hidden behind a nearer wall
     bool anyVisible = false;
     for (int16_t col = clampedLeft; col <= clampedRight; col++) {
-      if (zbuffer[col] > fdist8) { anyVisible = true; break; }
+      if (zbAt(col) > fdist8) { anyVisible = true; break; }
     }
     if (!anyVisible) continue;
 
-    // halo: erase a 1px black border around the sprite's bounding box
-    // (including the nub) so it always has contrast against whatever
-    // wall pixels sit behind it
-    int16_t hx = clampi(left - 1, 0, 127);
-    int16_t hy = clampi(spriteTop - 1, 0, 63);
-    int16_t hw = clampi(rightCol + 1, 0, 127) - hx + 1;
-    int16_t hh = clampi(bodyBottom + 1, 0, 63) - hy + 1;
+    // halo: erase a 2px black border around the sprite's bounding box
+    // (including the nub and, for ranged enemies, the sensor light) so
+    // it always has strong contrast against whatever's behind it
+    int16_t hx = clampi(left - 2, 0, 127);
+    int16_t hy = clampi(spriteTop - topMargin - 2, 0, 63);
+    int16_t hw = clampi(rightCol + 2, 0, 127) - hx + 1;
+    int16_t hh = clampi(bodyBottom + 2, 0, 63) - hy + 1;
     if (hw > 0 && hh > 0) {
       u8g2.setDrawColor(0);
       u8g2.drawBox(hx, hy, hw, hh);
@@ -748,7 +764,7 @@ void drawEnemies() {
 
     // body
     for (int16_t col = bClampedLeft; col <= bClampedRight; col++) {
-      if (zbuffer[col] <= fdist8) continue; // occluded by a nearer wall
+      if (zbAt(col) <= fdist8) continue; // occluded by a nearer wall
       if (flash && ((col + frameCount) & 1)) continue; // hatched while flashing
       u8g2.drawVLine(col, bodyTop, bodyBottom - bodyTop + 1);
     }
@@ -766,19 +782,29 @@ void drawEnemies() {
     }
 
     if (e.isRanged) {
+      // persistent blinking sensor light above the head - visible at all
+      // times, not just when firing, so a ranged enemy is identifiable
+      // on sight rather than only after it's already shot at you
+      if (frameCount & 8) {
+        u8g2.drawBox(screenX - 1, headCY - headR - 4, 2, 2);
+      }
+
       // weapon nub sticking out from the body
       int16_t nubX = bodyRight;
       int16_t nubY = bodyTop + size / 4;
       if (nubX >= clampedLeft && nubX <= clampedRight) {
-        u8g2.drawBox(nubX, nubY, nubW, 2);
+        u8g2.drawBox(nubX, nubY, nubW, 3);
       }
-      // muzzle flash burst when it fires - motion is a far stronger cue
-      // than any static color difference could be
+
+      // muzzle flash burst + tracer line when it fires - motion is a far
+      // stronger cue than any static color difference could be, and the
+      // tracer visually ties the shot back to its source
       if (e.shootFlash > 0) {
         int16_t fx = nubX + nubW, fy = nubY + 1;
         int16_t r = 2 + (e.shootFlash > 3 ? 3 : e.shootFlash);
         u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
         u8g2.drawTriangle(fx - r, fy, fx, fy + r / 2, fx + r, fy);
+        if (e.shootFlash > 3) u8g2.drawLine(fx, fy, 64, 32);
       }
     }
   }
@@ -844,6 +870,21 @@ void drawKillHUD() {
   // single-digit kill count / enemy total only (NUM_ENEMIES is <= 9)
   char buf[6] = { 'K', ':', (char)('0' + killCount), '/', (char)('0' + NUM_ENEMIES), '\0' };
   u8g2.drawStr(2, 61, buf);
+}
+
+// ============================================================
+// HIT MARKER - bold X flash at the crosshair when a shot lands.
+// Drawn in normal (color 1) mode; it tends to land right where an
+// enemy's own black halo was just erased, so contrast is usually
+// guaranteed for free in exactly the moment it's needed.
+// ============================================================
+void drawHitMarker() {
+  if (hitMarkerTimer == 0) return;
+  int16_t cx = 64, cy = 32, s = 5;
+  u8g2.drawLine(cx - s, cy - s, cx + s, cy + s);
+  u8g2.drawLine(cx - s, cy + s, cx + s, cy - s);
+  u8g2.drawLine(cx - s, cy - s + 1, cx + s - 1, cy + s);
+  u8g2.drawLine(cx - s + 1, cy + s, cx + s, cy - s + 1);
 }
 
 // draws one gun part with a tight 1px keyline hugging just that
@@ -984,6 +1025,7 @@ void loop() {
         dmgLedTimer--;
         if (dmgLedTimer == 0) digitalWrite(LED_PIN_DMG, LOW);
       }
+      if (hitMarkerTimer > 0) hitMarkerTimer--;
       if (reloading) {
         reloadTimer--;
         if (reloadTimer == 0) {
@@ -1001,6 +1043,7 @@ void loop() {
       drawHUD();
       drawAmmoHUD();
       drawKillHUD();
+      drawHitMarker();
       u8g2.sendBuffer();
 
       checkWinLose();
