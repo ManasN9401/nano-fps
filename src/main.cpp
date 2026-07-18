@@ -276,8 +276,12 @@ const int16_t PROGMEM colAngleOffset[128] = {
 // GAME CONSTANTS (tune these after your first test flash)
 // ============================================================
 #define FP_ONE          256      // Q8 fixed point: 1 map cell = 256
-#define MOVE_SPEED      18       // player move speed, Q8 units/frame (bumped up - was 12)
-#define TURN_SPEED      15       // player turn speed, angle units/frame of 1024 (bumped up - was 10)
+#define MOVE_SPEED      18       // player move speed, Q8 units per TARGET_FRAME_MS of real time
+#define TURN_SPEED      15       // player turn speed, angle units per TARGET_FRAME_MS of real time
+#define TARGET_FRAME_MS 50       // reference frame time the speeds above are tuned for -
+                                  // actual speed is scaled by real elapsed time each frame (see
+                                  // frameDeltaMs), so movement/turning stay consistent in real-world
+                                  // terms even when a frame is unusually cheap or expensive to render
 #define COLLIDE_R       50       // player collision radius, Q8 units
 #define RAY_STEP        36       // raycast march step, Q8 units (was 28 - fewer steps/ray = more spare CPU per frame)
 #define MAX_RAY_DIST    2304     // max ray length, Q8 units (9 cells, was 10 - trims worst-case ray length a bit)
@@ -339,6 +343,8 @@ uint8_t zbuffer[NUM_RAY_COLS]; // per-ray wall distance (>>3), for sprite occlus
 uint8_t fireCooldown = 0;
 uint8_t gunFlashTimer = 0;   // frames remaining of muzzle-flash/recoil animation
 uint8_t frameCount = 0;      // free-running counter, used for flash/hatch patterns
+uint32_t lastFrameMs = 0;    // millis() timestamp of the previous frame
+uint16_t frameDeltaMs = TARGET_FRAME_MS; // real elapsed time for the current frame
 bool btnLeft, btnRight, btnForward, btnFire, prevFireMenu = false;
 uint8_t stateEnterGuard = 0; // ignore fire briefly after entering a menu state
 
@@ -346,7 +352,6 @@ uint8_t ammoInMag = MAG_SIZE;
 bool reloading = false;
 uint8_t reloadTimer = 0;
 uint8_t dmgLedTimer = 0;     // non-blocking replacement for the old delay()-based "stun" LED
-uint8_t hitMarkerTimer = 0;  // frames remaining of the "shot landed" crosshair flash
 uint8_t killCount = 0;
 
 static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
@@ -359,6 +364,8 @@ static inline int16_t clampi(int16_t v, int16_t lo, int16_t hi) {
 // columns (0-127) since each ray covers a 2px-wide strip - this is the
 // one place that conversion happens.
 static inline uint8_t zbAt(int16_t screenX) {
+  if (screenX < 0) screenX = 0;
+  if (screenX > 127) screenX = 127;
   return zbuffer[screenX >> 1];
 }
 
@@ -440,6 +447,8 @@ void resetGame() {
   }
   gunFlashTimer = 0;
   frameCount = 0;
+  lastFrameMs = millis();
+  frameDeltaMs = TARGET_FRAME_MS;
   ammoInMag = MAG_SIZE;
   reloading = false;
   reloadTimer = 0;
@@ -461,14 +470,23 @@ void readButtons() {
 // PLAYER MOVEMENT
 // ============================================================
 void updatePlayer() {
-  if (btnLeft)  player.angle = (player.angle - TURN_SPEED) & 1023;
-  if (btnRight) player.angle = (player.angle + TURN_SPEED) & 1023;
+  // scale by real elapsed time, not frame count - a frame that took twice as
+  // long to render (e.g. a view full of the mortar-pattern walls) still
+  // covers the correct real-world distance/turn instead of silently "slowing
+  // down", and a cheap frame doesn't silently "speed up"
+  int16_t moveSpeed = (int16_t)(((int32_t)MOVE_SPEED * frameDeltaMs) / TARGET_FRAME_MS);
+  int16_t turnSpeed = (int16_t)(((int32_t)TURN_SPEED * frameDeltaMs) / TARGET_FRAME_MS);
+  if (moveSpeed < 1) moveSpeed = 1;
+  if (turnSpeed < 1) turnSpeed = 1;
+
+  if (btnLeft)  player.angle = (player.angle - turnSpeed) & 1023;
+  if (btnRight) player.angle = (player.angle + turnSpeed) & 1023;
 
   if (btnForward) {
     int16_t dx = pgm_read_word(&cosTable[player.angle]);
     int16_t dy = pgm_read_word(&sinTable[player.angle]);
-    int16_t stepX = ((int32_t)dx * MOVE_SPEED) >> 8;
-    int16_t stepY = ((int32_t)dy * MOVE_SPEED) >> 8;
+    int16_t stepX = ((int32_t)dx * moveSpeed) >> 8;
+    int16_t stepY = ((int32_t)dy * moveSpeed) >> 8;
 
     int16_t newX = player.posX + stepX;
     int16_t edgeX = (stepX >= 0) ? COLLIDE_R : -COLLIDE_R;
@@ -604,7 +622,6 @@ void handleFire() {
   if (bestIdx >= 0) {
     enemies[bestIdx].hp -= SHOT_DAMAGE;
     enemies[bestIdx].hitFlash = 8;
-    hitMarkerTimer = 6;
     tone(PIN_BUZZER, 600, 40);
     if (enemies[bestIdx].hp <= 0) {
       enemies[bestIdx].alive = false;
@@ -740,19 +757,24 @@ void drawEnemies() {
 
     uint8_t fdist8 = (forward >> 3 > 255) ? 255 : (uint8_t)(forward >> 3);
 
-    // skip entirely if every column is hidden behind a nearer wall
-    bool anyVisible = false;
+    // find the actual visible run of columns - NOT just "is any column
+    // visible", but the real left/right bounds of what's visible. Using
+    // the full bounding box for the halo (as before) would erase wall
+    // pixels behind the part of the sprite that's actually hidden behind
+    // a nearer wall corner - that mismatch was the "black box" glitch.
+    int16_t visLeft = -1, visRight = -1;
     for (int16_t col = clampedLeft; col <= clampedRight; col++) {
-      if (zbAt(col) > fdist8) { anyVisible = true; break; }
+      if (zbAt(col) > fdist8) {
+        if (visLeft < 0) visLeft = col;
+        visRight = col;
+      }
     }
-    if (!anyVisible) continue;
+    if (visLeft < 0) continue; // fully occluded, nothing to draw
 
-    // halo: erase a 2px black border around the sprite's bounding box
-    // (including the nub and, for ranged enemies, the sensor light) so
-    // it always has strong contrast against whatever's behind it
-    int16_t hx = clampi(left - 2, 0, 127);
+    // halo only spans the visible run, not the full bounding box
+    int16_t hx = clampi(visLeft - 2, 0, 127);
     int16_t hy = clampi(spriteTop - topMargin - 2, 0, 63);
-    int16_t hw = clampi(rightCol + 2, 0, 127) - hx + 1;
+    int16_t hw = clampi(visRight + 2, 0, 127) - hx + 1;
     int16_t hh = clampi(bodyBottom + 2, 0, 63) - hy + 1;
     if (hw > 0 && hh > 0) {
       u8g2.setDrawColor(0);
@@ -770,36 +792,37 @@ void drawEnemies() {
     }
 
     // head - round for melee ("just a creature"), square for ranged
-    // ("armed and dangerous") - a shape cue works regardless of panel color
-    if (!flash || !(frameCount & 1)) {
-      if (screenX >= bClampedLeft - headR && screenX <= bClampedRight + headR) {
-        if (e.isRanged) {
-          u8g2.drawBox(screenX - headR, headCY - headR, headR * 2, headR * 2);
-        } else {
-          u8g2.drawDisc(screenX, headCY, headR);
-        }
+    // ("armed and dangerous") - a shape cue works regardless of panel
+    // color. Gated on its own occlusion check now, not just bounds.
+    if ((!flash || !(frameCount & 1)) && zbAt(screenX) > fdist8) {
+      if (e.isRanged) {
+        u8g2.drawBox(screenX - headR, headCY - headR, headR * 2, headR * 2);
+      } else {
+        u8g2.drawDisc(screenX, headCY, headR);
       }
     }
 
     if (e.isRanged) {
+      int16_t nubX = bodyRight;
+      int16_t nubY = bodyTop + size / 4;
+      bool nubVisible = zbAt(nubX) > fdist8;
+
       // persistent blinking sensor light above the head - visible at all
       // times, not just when firing, so a ranged enemy is identifiable
       // on sight rather than only after it's already shot at you
-      if (frameCount & 8) {
+      if ((frameCount & 8) && zbAt(screenX) > fdist8) {
         u8g2.drawBox(screenX - 1, headCY - headR - 4, 2, 2);
       }
 
       // weapon nub sticking out from the body
-      int16_t nubX = bodyRight;
-      int16_t nubY = bodyTop + size / 4;
-      if (nubX >= clampedLeft && nubX <= clampedRight) {
+      if (nubVisible && nubX >= clampedLeft && nubX <= clampedRight) {
         u8g2.drawBox(nubX, nubY, nubW, 3);
       }
 
-      // muzzle flash burst + tracer line when it fires - motion is a far
-      // stronger cue than any static color difference could be, and the
-      // tracer visually ties the shot back to its source
-      if (e.shootFlash > 0) {
+      // muzzle flash burst + tracer line when it fires - only if the
+      // nub itself is actually visible, or the flash would appear to
+      // erupt from inside a wall
+      if (e.shootFlash > 0 && nubVisible) {
         int16_t fx = nubX + nubW, fy = nubY + 1;
         int16_t r = 2 + (e.shootFlash > 3 ? 3 : e.shootFlash);
         u8g2.drawTriangle(fx - r, fy, fx, fy - r, fx + r, fy);
@@ -870,21 +893,6 @@ void drawKillHUD() {
   // single-digit kill count / enemy total only (NUM_ENEMIES is <= 9)
   char buf[6] = { 'K', ':', (char)('0' + killCount), '/', (char)('0' + NUM_ENEMIES), '\0' };
   u8g2.drawStr(2, 61, buf);
-}
-
-// ============================================================
-// HIT MARKER - bold X flash at the crosshair when a shot lands.
-// Drawn in normal (color 1) mode; it tends to land right where an
-// enemy's own black halo was just erased, so contrast is usually
-// guaranteed for free in exactly the moment it's needed.
-// ============================================================
-void drawHitMarker() {
-  if (hitMarkerTimer == 0) return;
-  int16_t cx = 64, cy = 32, s = 5;
-  u8g2.drawLine(cx - s, cy - s, cx + s, cy + s);
-  u8g2.drawLine(cx - s, cy + s, cx + s, cy - s);
-  u8g2.drawLine(cx - s, cy - s + 1, cx + s - 1, cy + s);
-  u8g2.drawLine(cx - s + 1, cy + s, cx + s, cy - s + 1);
 }
 
 // draws one gun part with a tight 1px keyline hugging just that
@@ -1012,6 +1020,15 @@ void loop() {
 
     case ST_PLAYING: {
       frameCount++;
+
+      uint32_t nowMs = millis();
+      uint32_t dt = nowMs - lastFrameMs; // wraps correctly even if millis() overflows
+      lastFrameMs = nowMs;
+      if (dt > 200) dt = 200; // clamp big stalls (e.g. first frame after a menu) so a single
+                              // slow frame can't fling the player a huge distance
+      if (dt < 1) dt = 1;
+      frameDeltaMs = (uint16_t)dt;
+
       updatePlayer();
       updateEnemyAI();
       if (fireCooldown > 0) fireCooldown--;
@@ -1025,7 +1042,6 @@ void loop() {
         dmgLedTimer--;
         if (dmgLedTimer == 0) digitalWrite(LED_PIN_DMG, LOW);
       }
-      if (hitMarkerTimer > 0) hitMarkerTimer--;
       if (reloading) {
         reloadTimer--;
         if (reloadTimer == 0) {
@@ -1043,7 +1059,6 @@ void loop() {
       drawHUD();
       drawAmmoHUD();
       drawKillHUD();
-      drawHitMarker();
       u8g2.sendBuffer();
 
       checkWinLose();
